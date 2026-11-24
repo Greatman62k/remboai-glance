@@ -18,6 +18,9 @@ interface ReadyInfo {
   done_signal: string
 }
 
+let currentStage = 'startup'
+let lastTranscriptionShape = ''
+
 class MemoryStorage implements StorageLike {
   readonly values = new Map<string, string>()
   getItem(key: string): string | null { return this.values.get(key) ?? null }
@@ -51,6 +54,24 @@ async function main(): Promise<void> {
     const headers = new Headers(init?.headers)
     headers.set('Origin', ready.origin)
     const response = await fetch(input, { ...init, headers })
+    const requestUrl = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+    if (requestUrl.endsWith('/transcriptions')) {
+      const raw = await response.clone().text()
+      let payload: { data?: Record<string, unknown> } | null = null
+      try { payload = JSON.parse(raw) as { data?: Record<string, unknown> } } catch {}
+      const data = payload?.data
+      lastTranscriptionShape = JSON.stringify({
+        status: response.status,
+        contentType: response.headers.get('content-type'),
+        bodyLength: raw.length,
+        requestId: response.headers.get('x-request-id'),
+        topLevelKeys: payload ? Object.keys(payload).sort() : [],
+        dataKeys: data ? Object.keys(data).sort() : [],
+        transcriptType: typeof data?.transcript,
+        transcriptLength: typeof data?.transcript === 'string' ? data.transcript.length : null,
+        durationType: typeof data?.duration_ms,
+      })
+    }
     if (headers.has('Authorization') && response.headers.get('access-control-allow-origin') === ready.origin) {
       authenticatedCorsResponseCount += 1
     }
@@ -58,6 +79,7 @@ async function main(): Promise<void> {
   }
   const api = new GlanceApiClient(ready.api_base, sessions, fetchWithOrigin, 10_000)
 
+  currentStage = 'CORS preflight'
   const preflight = await fetch(ready.api_base + '/transcriptions', {
     method: 'OPTIONS',
     headers: {
@@ -71,16 +93,24 @@ async function main(): Promise<void> {
   const allowedHeaders = preflight.headers.get('access-control-allow-headers')?.toLowerCase() ?? ''
   assert(allowedHeaders.includes('authorization') && allowedHeaders.includes('content-type'), 'CORS omitted Authorization or Content-Type')
 
+  currentStage = 'pairing exchange'
   const paired = await api.exchangePairing(ready.pairing_code, 'Day 5 synthetic G2')
   sessions.save(paired)
   assert(sessions.load()?.access_token === paired.access_token, 'paired session was not stored in the injected memory store')
 
+  currentStage = 'inbox and CORS'
   const inbox = await api.getInbox()
   assert(authenticatedCorsResponseCount > 0, 'authenticated cross-origin API response omitted the configured Allow-Origin header')
   assert(inbox.items.length === 2, `Expected two open cases in the paired salon, got ${inbox.items.length}`)
+  currentStage = 'case context and tenant isolation'
   const detail = await api.getCase(ready.salon_case_id)
   assert(detail.has_earlier && detail.context.length === 10, 'case detail did not return the latest ten with earlier-message look-ahead')
   assert(detail.context.every((item, index, values) => index === 0 || values[index - 1]!.sequence < item.sequence), 'case context is not ascending by sequence')
+  currentStage = 'case status'
+  const initialStatus = await api.getCaseStatus(ready.salon_case_id)
+  assert(initialStatus.version === detail.version && initialStatus.case_id === detail.case_id && initialStatus.latest_reply === null,
+    'lightweight case status did not match the case snapshot')
+  assert(!('context' in initialStatus) && !('customer_label' in initialStatus), 'case status returned unnecessary customer context')
   const foreign = await fetch(`${ready.api_base}/cases/${ready.other_salon_case_id}`, {
     headers: { Authorization: `Bearer ${paired.access_token}`, Origin: ready.origin },
   })
@@ -91,10 +121,12 @@ async function main(): Promise<void> {
   assert((await foreign.json() as { error?: { code?: string } }).error?.code === (await missing.json() as { error?: { code?: string } }).error?.code,
     'cross-salon and absent case errors differ')
 
+  currentStage = 'AI draft and revision'
   const aiCase = detail
   const initialDraft = await api.createDraft(aiCase.case_id, aiCase.version, randomUUID())
   assert(initialDraft.source === 'ai' && initialDraft.based_on_version === aiCase.version, 'AI draft was not persisted against current case version')
 
+  currentStage = 'transcription and Use as instruction'
   const transcript = 'Please make the reply warmer and shorter.'
   const pcm = new Uint8Array(6_400)
   let transcribed
@@ -113,6 +145,9 @@ async function main(): Promise<void> {
   const aiReply = await api.approveReply(aiCase.case_id, aiCase.version, revised.draft_id, phoneEditedAiText, aiReplyKey)
   const replay = await api.approveReply(aiCase.case_id, aiCase.version, revised.draft_id, phoneEditedAiText, aiReplyKey)
   assert(replay.reply_id === aiReply.reply_id && replay.case_version === aiReply.case_version, 'approval retry did not replay its original outcome')
+  const queuedStatus = await api.getCaseStatus(aiCase.case_id)
+  assert(queuedStatus.version === aiReply.case_version && queuedStatus.latest_reply?.reply_id === aiReply.reply_id &&
+    queuedStatus.latest_reply.state === 'queued', 'lightweight status did not expose the queued reply/version')
   await rejectedCode(
     () => api.approveReply(aiCase.case_id, aiCase.version, revised.draft_id, phoneEditedAiText + ' Changed.', aiReplyKey),
     'idempotency_conflict',
@@ -127,6 +162,7 @@ async function main(): Promise<void> {
   assert(aiResolved.status === 'resolved' && aiResolved.cancelled_reply_ids.includes(aiReply.reply_id), 'resolution did not cancel the still-queued reply')
   assert((await api.getReply(aiReply.reply_id)).state === 'cancelled', 'cancelled reply status was not recoverable')
 
+  currentStage = 'Use as reply, approval and dispatch'
   const manualCase = await api.getCase(ready.manual_case_id)
   const manualTranscript = await api.transcribeAudio(new Uint8Array(6_400))
   assert(manualTranscript.transcript === transcript, 'manual-reply transcription did not parse the canonical response')
@@ -152,6 +188,9 @@ async function main(): Promise<void> {
     acknowledge_unknown_reply: false,
   })
   assert(manualResolved.status === 'resolved' && !manualResolved.cancelled_reply_ids.includes(manualReply.reply_id), 'submitted reply was incorrectly treated as a queued cancellation')
+  const resolvedStatus = await api.getCaseStatus(manualCase.case_id)
+  assert(resolvedStatus.status === 'resolved' && resolvedStatus.version === manualResolved.version &&
+    resolvedStatus.latest_reply?.state === 'submitted', 'lightweight status did not reflect resolved case and submitted reply')
 
   // The configured Caddy transcription matcher must accept the exact boundary
   // and reject one byte above it before the provider; other app routes retain
@@ -161,13 +200,24 @@ async function main(): Promise<void> {
   assert(maximumResult.transcript === transcript, 'Caddy did not forward the exact maximum supported audio body')
   maximumPcm.fill(0)
   const bearer = sessions.load()!.access_token
+  currentStage = 'Caddy body-size boundaries'
+  const chunkedOversize = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(new Uint8Array(640_000))
+      controller.enqueue(new Uint8Array(640_001))
+      controller.close()
+    },
+  })
   const tooLarge = await fetch(`${ready.api_base}/transcriptions`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${bearer}`, Origin: ready.origin, 'Content-Type': 'application/octet-stream' },
-    body: new Uint8Array(1_280_001),
-  })
-  assert(tooLarge.status === 413 && (await tooLarge.json() as { error?: { code?: string } }).error?.code === 'audio_too_large',
-    'Caddy did not return the bounded oversized transcription error')
+    body: chunkedOversize,
+    duplex: 'half',
+  } as RequestInit & { duplex: 'half' })
+  const tooLargeBody = await tooLarge.json().catch(() => null) as { error?: { code?: string } } | null
+  const tooLargeCode = tooLargeBody?.error?.code ?? 'missing'
+  assert(tooLarge.status === 413 && tooLargeCode === 'audio_too_large',
+    `Caddy oversized response mismatch (status ${tooLarge.status}, content-type ${tooLarge.headers.get('content-type') ?? 'missing'}, error code ${tooLargeCode})`)
   const ordinaryTooLarge = await fetch(`${ready.api_base}/pairing/exchange`, {
     method: 'POST',
     headers: { Origin: ready.origin, 'Content-Type': 'application/json' },
@@ -187,6 +237,9 @@ async function main(): Promise<void> {
 
 void main().catch((error: unknown) => {
   const safe = error instanceof ApiError ? `${error.code} (${error.status})` : error instanceof Error ? error.message : 'unknown failure'
-  console.error(`FAIL: ${safe}`)
+  console.error(`FAIL: ${currentStage}: ${safe}`)
+  if (currentStage === 'transcription and Use as instruction' && lastTranscriptionShape) {
+    console.error(`Transcription response shape: ${lastTranscriptionShape}`)
+  }
   process.exitCode = 1
 })

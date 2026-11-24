@@ -1,6 +1,7 @@
 import {
   AudioInputSource,
   CreateStartUpPageContainer,
+  RebuildPageContainer,
   StartUpPageCreateResult,
   TextContainerProperty,
   TextContainerUpgrade,
@@ -24,19 +25,31 @@ async function connectGlasses(): Promise<void> {
     app.setGlassesStatus('Even Hub bridge ready · creating G2 display…')
     const initialText = app.getGlassText() || 'REMBOAI GLANCE'
     const container = new TextContainerProperty({
-      xPosition: 144,
-      yPosition: 72,
-      width: 288,
-      height: 144,
+      xPosition: 0,
+      yPosition: 0,
+      width: 576,
+      height: 288,
       containerID: 2,
       containerName: 'text-1',
+      borderWidth: 1,
+      borderColor: 8,
+      borderRadius: 2,
+      paddingLength: 12,
       isEventCapture: 1,
       content: initialText,
     })
     const result = await bridge.createStartUpPageContainer(
       new CreateStartUpPageContainer({ containerTotalNum: 1, textObject: [container] }),
     )
-    if (StartUpPageCreateResult.normalize(result) !== StartUpPageCreateResult.success) {
+    let pageReady = StartUpPageCreateResult.normalize(result) === StartUpPageCreateResult.success
+    if (!pageReady && StartUpPageCreateResult.normalize(result) === StartUpPageCreateResult.invalid) {
+      // A WebView reload can retain the native Even Hub page. Rebuild it in
+      // place when create reports "invalid"; malformed layouts still fail here.
+      pageReady = await bridge.rebuildPageContainer(
+        new RebuildPageContainer({ containerTotalNum: 1, textObject: [container] }),
+      )
+    }
+    if (!pageReady) {
       app.setGlassesStatus(`G2 display was rejected by SDK (${String(result)}).`)
       app.setGlassesAvailable(false)
       return

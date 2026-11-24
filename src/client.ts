@@ -3,6 +3,7 @@ import type {
   ApiEnvelope,
   ApiErrorEnvelope,
   CaseData,
+  CaseStatusData,
   DraftData,
   InboxData,
   ReplyData,
@@ -31,6 +32,7 @@ export interface GlanceApi {
   revokeCurrentSession(signal?: AbortSignal): Promise<void>
   getInbox(signal?: AbortSignal): Promise<InboxData>
   getCase(caseId: string, signal?: AbortSignal): Promise<CaseData>
+  getCaseStatus(caseId: string, signal?: AbortSignal): Promise<CaseStatusData>
   createDraft(caseId: string, expectedVersion: number, key: string, signal?: AbortSignal): Promise<DraftData>
   createManualDraft(caseId: string, expectedVersion: number, text: string, key: string, signal?: AbortSignal): Promise<DraftData>
   reviseDraft(caseId: string, draftId: string, expectedVersion: number, instruction: string, key: string, signal?: AbortSignal): Promise<DraftData>
@@ -166,6 +168,14 @@ export class GlanceApiClient {
     return this.request<CaseData>(
       'GET',
       `/cases/${encodeURIComponent(caseId)}`,
+      { signal },
+    )
+  }
+
+  getCaseStatus(caseId: string, signal?: AbortSignal): Promise<CaseStatusData> {
+    return this.request<CaseStatusData>(
+      'GET',
+      `/cases/${encodeURIComponent(caseId)}/status`,
       { signal },
     )
   }

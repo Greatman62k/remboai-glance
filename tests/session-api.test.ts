@@ -135,6 +135,7 @@ test('all Glance API methods use the backend route and request contracts', async
     if (path === '/pairing/exchange') return session('route-test-token')
     if (path === '/inbox?limit=20') return { items: [], open_count: 0, has_more: false, next_cursor: null }
     if (path === `/cases/${caseId}`) return { case_id: caseId, version: 3, status: 'open', category: 'human_request', channel: 'telegram', customer_label: 'Amina', latest_reply: null, has_earlier: false, context: [] }
+    if (path === `/cases/${caseId}/status`) return { case_id: caseId, version: 3, status: 'open', latest_reply: null, case_updated_at: new Date().toISOString() }
     if (path === `/cases/${caseId}/drafts` || path === `/cases/${caseId}/drafts/manual` || path === `/cases/${caseId}/drafts/${draftId}/revise`) return { draft_id: draftId, based_on_version: 3, text: 'Exact customer text.', source: 'ai', expires_at: new Date(Date.now() + 60_000).toISOString() }
     if (path === `/cases/${caseId}/replies`) return { reply_id: replyId, state: 'queued', case_version: 4 }
     if (path === `/replies/${replyId}`) return { reply_id: replyId, case_id: caseId, state: 'queued', delivery: 'unsupported', error_category: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), submitted_at: null, delivered_at: null, failed_at: null }
@@ -156,6 +157,7 @@ test('all Glance API methods use the backend route and request contracts', async
   store.save(paired)
   await client.getInbox()
   await client.getCase(caseId)
+  await client.getCaseStatus(caseId)
   await client.createDraft(caseId, 3, '33333333-3333-4333-8333-333333333333')
   await client.createManualDraft(caseId, 3, 'Owner text.', '44444444-4444-4444-8444-444444444444')
   await client.reviseDraft(caseId, draftId, 3, 'Make it shorter.', '55555555-5555-4555-8555-555555555555')
@@ -165,18 +167,18 @@ test('all Glance API methods use the backend route and request contracts', async
   await client.revokeCurrentSession()
 
   assert.deepEqual(calls.map((call) => [new URL(call.url).pathname.replace('/api/v1/glance', ''), call.init.method]), [
-    ['/pairing/exchange', 'POST'], ['/inbox', 'GET'], [`/cases/${caseId}`, 'GET'],
+    ['/pairing/exchange', 'POST'], ['/inbox', 'GET'], [`/cases/${caseId}`, 'GET'], [`/cases/${caseId}/status`, 'GET'],
     [`/cases/${caseId}/drafts`, 'POST'], [`/cases/${caseId}/drafts/manual`, 'POST'],
     [`/cases/${caseId}/drafts/${draftId}/revise`, 'POST'], [`/cases/${caseId}/replies`, 'POST'],
     [`/replies/${replyId}`, 'GET'], [`/cases/${caseId}/resolve`, 'POST'], ['/sessions/current', 'DELETE'],
   ])
-  assert.deepEqual(calls[3].body, { expected_version: 3 })
-  assert.deepEqual(calls[4].body, { expected_version: 3, text: 'Owner text.' })
-  assert.deepEqual(calls[5].body, { expected_version: 3, instruction: 'Make it shorter.' })
-  assert.deepEqual(calls[6].body, { expected_version: 3, draft_id: draftId, text: 'Exact customer text.' })
-  assert.equal(new Headers(calls[3].init.headers).get('Idempotency-Key'), '33333333-3333-4333-8333-333333333333')
-  assert.equal(new Headers(calls[6].init.headers).get('Idempotency-Key'), '66666666-6666-4666-8666-666666666666')
+  assert.deepEqual(calls[4].body, { expected_version: 3 })
+  assert.deepEqual(calls[5].body, { expected_version: 3, text: 'Owner text.' })
+  assert.deepEqual(calls[6].body, { expected_version: 3, instruction: 'Make it shorter.' })
+  assert.deepEqual(calls[7].body, { expected_version: 3, draft_id: draftId, text: 'Exact customer text.' })
+  assert.equal(new Headers(calls[4].init.headers).get('Idempotency-Key'), '33333333-3333-4333-8333-333333333333')
+  assert.equal(new Headers(calls[7].init.headers).get('Idempotency-Key'), '66666666-6666-4666-8666-666666666666')
   assert.equal(calls[0].body?.salon_id, undefined)
-  assert.equal(calls[6].body?.recipient, undefined)
+  assert.equal(calls[7].body?.recipient, undefined)
   assert.equal(store.load(), null)
 })

@@ -65,6 +65,20 @@ export interface CaseData {
   context: CaseMessage[]
 }
 
+export interface CaseStatusReply {
+  reply_id: string
+  state: ReplyState
+  updated_at: string
+}
+
+export interface CaseStatusData {
+  case_id: string
+  status: 'open' | 'resolved' | string
+  version: number
+  latest_reply: CaseStatusReply | null
+  case_updated_at: string
+}
+
 export interface DraftData {
   draft_id: string
   based_on_version: number

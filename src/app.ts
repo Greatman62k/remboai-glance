@@ -140,6 +140,8 @@ export class GlanceAppController {
   private uploadingPcm: Uint8Array | null = null
   private voiceGeneration = 0
   private voiceFinish: Promise<void> | null = null
+  private demoCaptureTimer: ReturnType<typeof globalThis.setInterval> | null = null
+  private demoCaptureStartedAt = 0
   private voiceDerivedDraftIds = new Set<string>()
   private lastRenderedGlasses = ''
   private renderedScreen: GlanceScreen | null = null
@@ -424,6 +426,7 @@ export class GlanceAppController {
   /** Synthetic-only voice walkthrough. It never opens the microphone or calls the backend. */
   private showDemoTranscript(): void {
     if (!this.state.fixtureMode || !this.state.caseData || this.state.caseData.status !== 'open') return
+    this.clearDemoCaptureTimer()
     this.voiceKeys.clear()
     this.state.voicePhase = 'transcript_ready'
     this.state.voiceDurationMs = 6_400
@@ -434,6 +437,48 @@ export class GlanceAppController {
     this.state.message = 'SIMULATED TRANSCRIPT · no microphone, ASR, backend, or customer message was used.'
     this.state.screen = 'voice'
     this.render()
+  }
+
+  /** Fixture-only recording state for deterministic display review. It never opens a microphone or calls ASR. */
+  private async beginDemoRecording(): Promise<void> {
+    if (!this.state.fixtureMode || !this.state.caseData || this.state.caseData.status !== 'open') return
+    await this.clearVoiceWorkflow('')
+    this.state.focusedAction = 0
+    this.state.voicePhase = 'recording'
+    this.state.voiceSimulation = true
+    this.state.voiceDurationMs = 0
+    this.state.voiceTranscript = ''
+    this.state.message = 'SIMULATED CAPTURE · microphone and ASR are off.'
+    this.demoCaptureStartedAt = Date.now()
+    this.state.screen = 'voice'
+    this.render()
+    this.demoCaptureTimer = globalThis.setInterval(() => {
+      if (!this.state.fixtureMode || this.state.screen !== 'voice' || this.state.voicePhase !== 'recording') {
+        this.clearDemoCaptureTimer()
+        return
+      }
+      this.state.voiceDurationMs = Math.min(40_000, Date.now() - this.demoCaptureStartedAt)
+      this.render()
+    }, 250)
+  }
+
+  private stopDemoRecording(): void {
+    if (!this.state.fixtureMode || this.state.voicePhase !== 'recording') return
+    this.state.voiceDurationMs = Math.max(1_000, Math.min(40_000, Date.now() - this.demoCaptureStartedAt))
+    this.clearDemoCaptureTimer()
+    this.state.voicePhase = 'transcript_ready'
+    this.state.voiceTranscriptionDurationMs = null
+    this.state.voiceTranscript = 'Please make it shorter and mention walk-ins may be available until 5 p.m.'
+    this.state.voiceSimulation = true
+    this.state.voiceError = ''
+    this.state.message = 'SIMULATED TRANSCRIPT · no microphone, ASR, backend, or customer message was used.'
+    this.render()
+  }
+
+  private clearDemoCaptureTimer(): void {
+    if (this.demoCaptureTimer !== null) globalThis.clearInterval(this.demoCaptureTimer)
+    this.demoCaptureTimer = null
+    this.demoCaptureStartedAt = 0
   }
 
   private async useVoiceTranscriptAsInstruction(): Promise<void> {
@@ -495,6 +540,7 @@ export class GlanceAppController {
 
   private async clearVoiceWorkflow(message: string): Promise<boolean> {
     ++this.voiceGeneration
+    this.clearDemoCaptureTimer()
     this.transcriptionController?.abort()
     this.transcriptionController = null
     this.uploadingPcm?.fill(0)
@@ -596,6 +642,7 @@ export class GlanceAppController {
 
     if (action === 'start-demo') return this.startDemo()
     if (action === 'simulate-voice') return this.showDemoTranscript()
+    if (action === 'start-demo-recording') return this.beginDemoRecording()
     if (action === 'pair') return this.pair()
     if (action === 'refresh-inbox') return this.loadInbox()
     if (action === 'open-case') return this.openCase(target.dataset.caseId ?? '')
@@ -605,7 +652,7 @@ export class GlanceAppController {
     }
     if (action === 'refresh-case') { await this.refreshCase(true); return }
     if (action === 'start-voice') return this.beginVoiceCapture()
-    if (action === 'stop-voice') return this.stopAndTranscribe('owner')
+    if (action === 'stop-voice') return this.state.fixtureMode ? this.stopDemoRecording() : this.stopAndTranscribe('owner')
     if (action === 'cancel-voice') {
       await this.clearVoiceWorkflow('Voice recording cancelled. Audio was cleared from memory.')
       this.state.screen = 'case'
@@ -1137,6 +1184,20 @@ export class GlanceAppController {
       const reply = await this.api.getReply(replyId)
       this.state.reply = reply
       this.state.replyId = reply.reply_id
+      if (this.state.caseData?.case_id === reply.case_id && this.state.caseData.latest_reply?.reply_id === reply.reply_id) {
+        this.state.caseData = {
+          ...this.state.caseData,
+          latest_reply: {
+            reply_id: reply.reply_id,
+            state: reply.state,
+            delivery: reply.delivery,
+            error_category: reply.error_category,
+            updated_at: reply.updated_at,
+            submitted_at: reply.submitted_at,
+            delivered_at: reply.delivered_at,
+          },
+        }
+      }
       this.state.connection = this.state.fixtureMode ? 'development-fixtures' : 'connected'
       if (shouldPollReply(reply.state) && schedule && this.state.autoPolls < 5) {
         const delay = replyPollDelay(this.state.autoPolls)
@@ -1369,7 +1430,7 @@ export class GlanceAppController {
     }
     if (this.state.screen === 'inbox') await this.loadInbox()
     else if (this.state.caseData && ['case', 'voice', 'draft', 'approval', 'resolve', 'status'].includes(this.state.screen)) {
-      await this.refreshCase()
+      await this.refreshCaseStatus()
       if (this.state.screen === 'status' && this.state.replyId) await this.fetchReply(this.state.replyId, true)
     }
   }
@@ -1387,8 +1448,59 @@ export class GlanceAppController {
     }
     if (this.state.screen === 'inbox' && this.state.sessionPresent || this.state.screen === 'inbox' && this.state.fixtureMode) {
       await this.loadInbox()
-    } else if (['case', 'voice', 'draft', 'approval', 'resolve'].includes(this.state.screen) && this.state.caseData) {
-      await this.refreshCase()
+    } else if (['case', 'voice', 'draft', 'approval', 'resolve', 'status'].includes(this.state.screen) && this.state.caseData) {
+      await this.refreshCaseStatus()
+    }
+  }
+
+  private async refreshCaseStatus(): Promise<void> {
+    const current = this.state.caseData
+    if (!current) return
+    try {
+      const status = await this.api.getCaseStatus(current.case_id)
+      if (this.state.caseData?.case_id !== current.case_id) return
+      if (status.version !== current.version || status.status !== current.status) {
+        await this.refreshCase()
+        if (this.state.screen === 'status' && this.state.replyId) await this.fetchReply(this.state.replyId, true)
+        return
+      }
+
+      const previous = current.latest_reply
+      const latest = status.latest_reply
+      if (!latest) {
+        if (previous) await this.refreshCase()
+        return
+      }
+      if (previous && previous.reply_id === latest.reply_id && previous.state === latest.state &&
+          previous.updated_at === latest.updated_at) return
+      if (this.state.screen === 'status') {
+        await this.fetchReply(latest.reply_id, true)
+        return
+      }
+
+      const reply = await this.api.getReply(latest.reply_id)
+      if (this.state.caseData?.case_id !== current.case_id) return
+      this.state.reply = reply
+      this.state.replyId = reply.reply_id
+      this.state.caseData = {
+        ...this.state.caseData,
+        latest_reply: {
+          reply_id: reply.reply_id,
+          state: reply.state,
+          delivery: reply.delivery,
+          error_category: reply.error_category,
+          updated_at: reply.updated_at,
+          submitted_at: reply.submitted_at,
+          delivered_at: reply.delivered_at,
+        },
+      }
+      this.state.connection = this.state.fixtureMode ? 'development-fixtures' : 'connected'
+      this.render()
+    } catch (error) {
+      this.state.connection = 'offline'
+      this.captureError(error)
+      this.handleLostSession(error)
+      this.render()
     }
   }
 
@@ -1409,13 +1521,14 @@ export class GlanceAppController {
         }
         if (selected === 0) return this.generateDraft()
         if (selected === 1) return this.beginManualDraft()
-        if (selected === 2) return this.state.fixtureMode ? this.showDemoTranscript() : this.beginVoiceCapture()
+        if (selected === 2) return this.state.fixtureMode ? this.beginDemoRecording() : this.beginVoiceCapture()
         if (selected === 3) return this.openLatestReply()
         if (selected === 4) { this.state.screen = 'resolve'; this.render(); return }
+        if (selected === 5) { this.state.screen = 'inbox'; this.render(); return }
         break
       case 'voice':
         if (this.state.voicePhase === 'recording') {
-          if (selected === 0) return this.stopAndTranscribe('owner')
+          if (selected === 0) return this.state.voiceSimulation ? this.stopDemoRecording() : this.stopAndTranscribe('owner')
           if (selected === 1) {
             await this.clearVoiceWorkflow('Voice recording cancelled. Audio was cleared from memory.')
             this.state.screen = 'case'
@@ -1456,7 +1569,7 @@ export class GlanceAppController {
   }
 
   private nextActionIndex(delta: number): number {
-    const counts: Record<GlanceScreen, number> = { pair: 1, inbox: 1, case: 5, voice: 2, draft: 2, approval: 2, status: 3, resolve: 2 }
+    const counts: Record<GlanceScreen, number> = { pair: 1, inbox: 1, case: 6, voice: 2, draft: 2, approval: 2, status: 3, resolve: 2 }
     const count = this.state.screen === 'case' && this.state.caseData?.status === 'resolved'
       ? 2
       : counts[this.state.screen]
@@ -1513,7 +1626,7 @@ export class GlanceAppController {
     const stale = this.state.stale ? '<div class="stale-strip">Case changed · refresh and create a current draft before approval.</div>' : ''
     const thread = events.map((event) => `<article class="message ${escapeHtml(event.actor)}"><div class="message-meta"><strong>${escapeHtml(event.actor === 'customer' ? item.customer_label : event.actor === 'assistant' ? 'RemboAI' : 'Owner')}</strong><time>${escapeHtml(dateTime(event.created_at))}</time></div><p>${escapeHtml(event.text)}</p></article>`).join('')
     const voiceAction = this.state.fixtureMode
-      ? button('Simulate voice transcript', 'simulate-voice', { disabled: item.status !== 'open' || this.state.busy })
+      ? button('Start simulated capture', 'start-demo-recording', { disabled: item.status !== 'open' || this.state.busy })
       : button('Record voice correction', 'start-voice', { disabled: item.status !== 'open' || this.state.busy || !this.state.sessionPresent || !this.state.glassesAvailable })
     return `<section class="panel case-panel"><button class="text-button back-link" data-action="back-inbox">← Inbox</button><div class="section-heading"><div><p class="eyebrow">${escapeHtml(categoryLabel(item.category))} · ${escapeHtml(item.channel.toUpperCase())}</p><h1>${escapeHtml(item.customer_label)}</h1></div><span class="status-tag ${item.status === 'resolved' ? 'resolved' : ''}">${escapeHtml(caseStatusText(item.status))} · v${item.version}</span></div>${stale}<p class="issue-summary">${escapeHtml(this.caseSummary(item))}</p><div class="context-label"><span>Customer-visible conversation</span>${item.has_earlier ? '<strong>Earlier messages omitted</strong>' : ''}</div><div class="thread-chunk">${thread || '<p class="subtle">No visible conversation is available.</p>'}</div><div class="chunk-nav">${button('Previous messages', 'page-back', { disabled: this.state.messagePage <= 0 })}<span>Chunk ${this.state.messagePage + 1} of ${pages}</span>${button('Next messages', 'page-next', { disabled: this.state.messagePage >= pages - 1 })}</div>${latest}<div class="button-row wrap">${button('Generate AI suggestion', 'generate-draft', { primary: true, disabled: item.status !== 'open' || this.state.busy })}${button('Write a reply', 'write-manually', { disabled: item.status !== 'open' || this.state.busy })}${voiceAction}${button('Resolve case', 'resolve', { disabled: item.status !== 'open' || this.state.busy })}${button('Refresh context', 'refresh-case')}</div><p class="poll-note">${this.state.fixtureMode ? 'SIMULATED TRANSCRIPT · fixture only; no microphone, ASR, backend, or message send.' : 'Voice recording starts only after your action. Drafts remain unsent until you approve exact text.'}</p></section>`
   }
@@ -1524,7 +1637,8 @@ export class GlanceAppController {
     if (!item) return this.renderLoading('Loading case')
     const duration = this.formatDuration(this.state.voiceDurationMs)
     if (phase === 'recording') {
-      return `<section class="panel voice-panel"><button class="text-button back-link" data-action="cancel-voice">← Cancel voice workflow</button><p class="eyebrow">G2 MICROPHONE ACTIVE</p><h1>Recording</h1><div class="recording-indicator"><span class="recording-dot"></span><strong>Microphone on</strong><span class="voice-duration">${duration}</span></div><p class="lead">Speak a short message. Stop when you are done. The recording stays in memory and is not saved.</p><div class="button-row">${button('Stop and transcribe', 'stop-voice', { primary: true })}${button('Cancel', 'cancel-voice')}</div><small>Maximum 40 seconds · G2 microphone only</small></section>`
+      const simulated = this.state.voiceSimulation
+      return `<section class="panel voice-panel"><button class="text-button back-link" data-action="cancel-voice">← Cancel voice workflow</button><p class="eyebrow">${simulated ? 'SIMULATED CAPTURE · MIC OFF' : 'G2 MICROPHONE ACTIVE'}</p><h1>${simulated ? 'Capture preview' : 'Recording'}</h1><div class="recording-indicator ${simulated ? 'simulated-recording' : ''}"><span class="recording-dot"></span><strong>${simulated ? 'Simulation only' : 'Microphone on'}</strong><span class="voice-duration">${duration}</span></div><p class="lead">${simulated ? 'Fixture-only display preview. No microphone or ASR is running.' : 'Speak a short message. Stop when you are done. The recording stays in memory and is not saved.'}</p><div class="button-row">${button(simulated ? 'Finish simulated capture' : 'Stop and transcribe', 'stop-voice', { primary: true })}${button('Cancel', 'cancel-voice')}</div><small>${simulated ? 'Synthetic fixture · no audio is captured' : 'Maximum 40 seconds · G2 microphone only'}</small></section>`
     }
     if (phase === 'transcript_ready') {
       const draft = this.state.draft
@@ -1538,8 +1652,8 @@ export class GlanceAppController {
             : 'This will revise the current AI suggestion only. The transcript is not a customer reply.'
       const transcriptLabel = this.state.voiceSimulation ? 'SIMULATED TRANSCRIPT · FIXTURE ONLY' : 'TRANSCRIPT · NOT SENT'
       const transcriptNote = this.state.voiceSimulation ? '<p class="warning-card">Synthetic walkthrough text · no microphone or ASR was used. This demo cannot contact customers.</p>' : ''
-      const againAction = this.state.voiceSimulation ? 'simulate-voice' : 'start-voice'
-      const againLabel = this.state.voiceSimulation ? 'Simulate voice transcript again' : 'Record again'
+      const againAction = this.state.voiceSimulation ? 'start-demo-recording' : 'start-voice'
+      const againLabel = this.state.voiceSimulation ? 'Start simulated capture again' : 'Record again'
       return `<section class="panel voice-panel"><button class="text-button back-link" data-action="voice-back-case">← Case</button><p class="eyebrow">${transcriptLabel}</p><h1>Choose what you meant</h1>${transcriptNote}<div class="voice-facts"><span>Captured ${duration}</span><span>${this.state.voiceSimulation ? 'Simulated' : 'Transcription'} ${this.state.voiceTranscriptionDurationMs ?? 0} ms</span></div><label for="voice-transcript">${this.state.voiceSimulation ? 'Synthetic words' : 'Recognized words'}</label><textarea id="voice-transcript" class="transcript-text" rows="6" readonly>${escapeHtml(this.state.voiceTranscript)}</textarea><div class="intent-cards"><div><h2>Use as reply</h2><p>Create an owner-authored draft from these words. You can edit the full reply before approval.</p>${button('Use as reply', 'use-transcript-reply', { primary: true, disabled: this.state.busy || item.status !== 'open' })}</div><div><h2>Use as instruction</h2><p>${escapeHtml(instructionWhy)}</p>${button('Use as instruction', 'use-transcript-instruction', { disabled: this.state.busy || !canInstruction })}</div></div><p class="subtle">Neither choice sends a message. Exact outgoing text still requires your separate approval.</p>${button(againLabel, againAction)}</section>`
     }
     if (phase === 'starting' || phase === 'stopping' || phase === 'transcribing') {
@@ -1654,116 +1768,182 @@ export class GlanceAppController {
 
   private buildGlassesText(): string {
     const state = this.state
-    const badge = state.fixtureMode ? 'REMBOAI · DEV FIXTURES' : 'REMBOAI GLANCE'
-    const lines = [badge]
+    const badge = state.fixtureMode ? 'GLANCE · SYNTHETIC' : 'REMBOAI GLANCE'
+    const lines: string[] = []
     const item = state.caseData
-    const actionLabel = (labels: string[]) => `› ${labels[state.focusedAction % labels.length]}`
-    const oneLine = (text: string, width = 27) => this.wrapText(text, width, 1)[0] ?? ''
+    // SDK 0.0.16 exposes a fixed firmware text style and left alignment only.
+    // The full 576 px canvas fits about 56 average-width glyphs at the native
+    // font; keep a little safety margin for wide letters and the 12 px inset.
+    const width = 56
+    const add = (text: string, maxLines = 1) => lines.push(...this.wrapText(text, width, maxLines))
+    const actionLabel = (labels: string[]) => add(`› ${labels[state.focusedAction % labels.length]} · DOUBLE-CLICK`)
+    // Firmware renders text at a fixed size. A short ASCII rule creates a
+    // stable section break without the unexpectedly wide box-drawing glyphs.
+    const divider = () => add('--------------------------------')
+    const finish = () => lines.slice(0, 9).join('\n')
 
     if (state.screen === 'pair') {
-      return [badge, 'PAIR ON YOUR PHONE', 'Enter the Telegram code', 'on the phone screen.'].join('\n')
+      add(`${badge} · PAIRING`)
+      add('OWNER SETUP · PAIRED PHONE')
+      divider()
+      add('Pairing code arrives in Telegram.')
+      add('Enter it in the paired phone WebView.')
+      add('One-time code · expires in 5 minutes.')
+      add('The code is never shown on G2.')
+      return finish()
     }
     if (state.screen === 'inbox') {
       const items = state.inbox?.items ?? []
       const selected = items[state.selectedIndex]
       if (!selected) {
-        return [badge, `${state.inbox?.open_count ?? 0} OPEN CASES`, state.connection === 'loading' ? 'Checking inbox…' : 'No open cases.', 'Refresh on the phone.'].join('\n')
+        add(`${badge} · INBOX`)
+        add(`${state.inbox?.open_count ?? 0} OPEN CASES`)
+        divider()
+        add(state.connection === 'loading' ? 'Checking for owner escalations…' : state.connection === 'offline' ? 'Inbox is unavailable offline.' : 'You are all caught up.')
+        add(state.connection === 'offline' ? 'Reconnect from the paired phone.' : 'Refresh from the paired phone.')
+        return finish()
       }
-      const more = state.inbox?.has_more ? ` · +${moreCaseCount(state.inbox.open_count, items.length)}` : ''
-      const position = `${state.selectedIndex + 1}/${items.length}`
-      const channel = selected.channel === 'telegram' ? 'TG' : 'WA'
-      lines.push(oneLine(`${state.inbox?.open_count ?? items.length} OPEN · ${position}${more} · OPEN`))
-      lines.push(oneLine(`${categoryLabel(selected.category).toUpperCase()} · ${channel}`))
-      lines.push(oneLine(`${selected.customer_label} · ${this.age(selected.created_at)}`))
-      lines.push(oneLine(state.inboxStale ? 'OFFLINE · CACHED DATA IS STALE' : selected.preview))
-      return lines.join('\n')
+      const position = `CASE ${state.selectedIndex + 1}/${items.length}${state.inbox?.has_more ? '+' : ''}`
+      const channel = selected.channel === 'telegram' ? 'TELEGRAM' : 'WHATSAPP'
+      add(`${badge} · INBOX${state.inboxStale ? ' · STALE' : ''}`)
+      add(`${state.inbox?.open_count ?? items.length} OPEN · ${position}`)
+      divider()
+      add(`SELECTED · ${selected.customer_label} / ${channel}`)
+      add(`${categoryLabel(selected.category).toUpperCase()} · ${this.age(selected.created_at)} WAITING`)
+      add(`LATEST · ${selected.preview}`)
+      if (items.length > 1) {
+        const next = items[(state.selectedIndex + 1) % items.length]
+        add(`NEXT · ${next.customer_label} / ${categoryLabel(next.category).toUpperCase()}`)
+        add(`LATEST · ${next.preview}`)
+      }
+      add('SCROLL CASES · DOUBLE-CLICK OPEN')
+      return finish()
     }
-    if (!item) return [badge, 'Loading case…'].join('\n')
+    if (!item) return `${badge}\nLOADING CASE…`
 
     if (state.screen === 'case') {
       const channel = item.channel === 'telegram' ? 'TG' : 'WA'
-      lines.push(oneLine(`${categoryLabel(item.category).toUpperCase()} · ${item.status.toUpperCase()} v${item.version}`, 28))
-      lines.push(oneLine(`${item.customer_label} · ${channel}`))
+      add(`${badge} · CASE DETAIL`)
+      add(`${item.customer_label} · ${categoryLabel(item.category).toUpperCase()}`)
+      add(`${item.status.toUpperCase()} · ${channel} · VERSION ${item.version}`)
+      divider()
       if (item.status === 'resolved') {
-        lines.push(oneLine(item.latest_reply ? presentReplyState(item.latest_reply.state, item.channel).label : 'CASE RESOLVED'))
-        lines.push(actionLabel(item.latest_reply ? ['CHECK REPLY STATUS', 'BACK TO INBOX'] : ['BACK TO INBOX', 'BACK TO INBOX']))
-        return lines.join('\n')
+        add(`LATEST REPLY · ${item.latest_reply ? presentReplyState(item.latest_reply.state, item.channel).label.toUpperCase() : 'NONE'}`)
+        actionLabel(item.latest_reply ? ['CHECK REPLY STATUS', 'BACK TO INBOX'] : ['BACK TO INBOX', 'BACK TO INBOX'])
+        add('CLICK · CHANGE ACTION  DOUBLE-CLICK · OPEN')
+        return finish()
       }
       const chunk = messagePage(item.context, state.messagePage, 3)
-      const message = [...chunk].reverse().find((entry) => entry.actor === 'customer') ?? chunk.at(-1)
-      lines.push(oneLine(message ? `C: ${message.text}` : this.caseSummary(item)))
-      lines.push(actionLabel(['GENERATE DRAFT', 'WRITE REPLY', 'VOICE CORRECTION', 'CHECK REPLY', 'RESOLVE CASE']))
-      return lines.join('\n')
+      const pages = Math.max(1, Math.ceil(item.context.length / 3))
+      add(`CONVERSATION · ${state.messagePage + 1}/${pages}${item.has_earlier ? ' · EARLIER OMITTED' : ''}`)
+      if (chunk.length) {
+        for (const message of chunk) {
+          const actor = message.actor === 'customer' ? 'CUST' : message.actor === 'assistant' ? 'AI' : 'OWNER'
+          add(`${actor} · ${message.text}`)
+        }
+      } else add(`LATEST · ${this.caseSummary(item)}`)
+      actionLabel(['GENERATE AI DRAFT', 'WRITE REPLY', 'VOICE CAPTURE', 'CHECK REPLY', 'RESOLVE CASE', 'BACK TO INBOX'])
+      return finish()
     }
     if (state.screen === 'voice') {
+      add(`${badge} · VOICE CAPTURE`)
+      divider()
       if (state.voicePhase === 'recording') {
-        lines.push('MICROPHONE ACTIVE')
-        lines.push(`CAPTURED ${this.formatDuration(state.voiceDurationMs)}`)
-        lines.push('SPEAK · STOP WHEN DONE')
-        lines.push(actionLabel(['STOP & TRANSCRIBE', 'CANCEL']))
+        add(state.voiceSimulation ? 'SIMULATION · MICROPHONE OFF' : '● G2 MICROPHONE ACTIVE')
+        add(`DURATION · ${this.formatDuration(state.voiceDurationMs)} / 0:40`)
+        add(state.voiceSimulation ? 'NO AUDIO CAPTURED · NO ASR' : 'PCM · MEMORY ONLY')
+        const actions = [state.voiceSimulation ? 'FINISH PREVIEW' : 'STOP & TRANSCRIBE', 'CANCEL']
+        actionLabel(actions)
+        add(`NEXT · ${actions[(state.focusedAction + 1) % actions.length]}`)
+        add('CLICK · NEXT ACTION  DOUBLE-CLICK · SELECT')
       } else if (state.voicePhase === 'transcript_ready') {
-        lines.push(state.voiceSimulation ? 'SIMULATED TRANSCRIPT' : 'TRANSCRIPT READY · NOT SENT')
-        lines.push(oneLine(state.voiceTranscript))
-        lines.push('CHOOSE INTENT ON PHONE')
-        lines.push(actionLabel(['OPEN PHONE REVIEW', 'BACK TO CASE']))
+        add(state.voiceSimulation ? 'SIMULATED · NOT SENT · NO ASR' : 'TRANSCRIPT · NOT SENT')
+        add(`CAPTURED ${this.formatDuration(state.voiceDurationMs)} · ASR ${state.voiceTranscriptionDurationMs ?? 0}MS`)
+        add('TRANSCRIPT PREVIEW')
+        add(state.voiceTranscript, 2)
+        add('PHONE · CHOOSE REPLY OR INSTRUCTION')
+        actionLabel(['OPEN PHONE REVIEW', 'BACK TO CASE'])
       } else if (state.voicePhase === 'error') {
-        lines.push('VOICE CAPTURE STOPPED')
-        lines.push(oneLine(state.voiceError || 'TRY AGAIN ON PHONE'))
-        lines.push(actionLabel(['RECORD AGAIN', 'BACK TO CASE']))
+        add('CAPTURE STOPPED · NO AUDIO RETAINED')
+        add(state.voiceError || 'TRY AGAIN ON PHONE', 2)
+        actionLabel(['RECORD AGAIN', 'BACK TO CASE'])
       } else {
-        lines.push(state.voicePhase === 'starting' ? 'MICROPHONE STARTING' : state.voicePhase === 'stopping' ? 'STOPPING MICROPHONE' : state.voicePhase === 'transcribing' ? 'TRANSCRIBING' : 'VOICE READY')
-        lines.push(state.voicePhase === 'transcribing' ? 'AUDIO IN MEMORY ONLY' : 'G2 MICROPHONE ONLY')
-        lines.push('FULL REVIEW ON PHONE')
-        lines.push(actionLabel(['RECORD / REVIEW', 'BACK TO CASE']))
+        const phaseLabel = state.voicePhase === 'starting' ? 'MICROPHONE STARTING' : state.voicePhase === 'stopping' ? 'STOPPING MICROPHONE' : state.voicePhase === 'transcribing' ? 'TRANSCRIBING' : 'READY · OWNER STARTED'
+        add(phaseLabel)
+        add(state.voicePhase === 'transcribing' ? `RECORDING · ${this.formatDuration(state.voiceDurationMs)} · MEMORY ONLY` : 'G2 MICROPHONE · EXPLICIT START')
+        add(state.voicePhase === 'transcribing' ? 'WAITING FOR TRANSCRIPT' : 'FULL TRANSCRIPT ON PHONE')
+        if (state.voicePhase === 'idle') actionLabel(['START RECORDING', 'BACK TO CASE'])
       }
-      return lines.join('\n')
+      return finish()
     }
     if (state.screen === 'draft') {
-      lines.push(state.fixtureMode ? 'SYNTHETIC PREVIEW · NOT AI' : state.draft?.source === 'owner' ? 'OWNER DRAFT · NOT SENT' : 'AI SUGGESTION · NOT SENT')
-      lines.push(`CASE v${item.version} · DRAFT v${state.draft?.based_on_version ?? item.version}`)
-      lines.push(oneLine(state.editorText || state.draft?.text || 'Write a reply on your phone.'))
-      lines.push(actionLabel(['REVIEW EXACT TEXT', 'BACK TO CASE']))
-      return lines.join('\n')
+      add(`${state.fixtureMode ? 'SYNTHETIC PREVIEW · NOT AI' : state.draft?.source === 'owner' ? 'OWNER DRAFT · NOT SENT' : 'AI SUGGESTION · NOT SENT'}`)
+      add('DRAFT · OWNER REVIEW REQUIRED')
+      divider()
+      add(`CASE v${item.version} · DRAFT BASE v${state.draft?.based_on_version ?? item.version}`)
+      add('CUSTOMER REPLY · PREVIEW')
+      add(state.editorText || state.draft?.text || 'Write a reply on your phone.', 2)
+      add('PHONE · EDIT COMPLETE CUSTOMER TEXT')
+      actionLabel(['REVIEW EXACT TEXT', 'BACK TO CASE'])
+      return finish()
     }
     if (state.screen === 'approval') {
-      lines.push('EXACT TEXT · PHONE REVIEWED')
-      lines.push(oneLine(state.approvalText))
-      lines.push(actionLabel(['APPROVE & QUEUE', 'CANCEL']))
-      return lines.join('\n')
+      add('FINAL REVIEW · EXACT CUSTOMER TEXT')
+      add('OWNER INSPECTED FULL TEXT ON PHONE')
+      divider()
+      add('MESSAGE PREVIEW · NOT YET QUEUED')
+      add(state.approvalText, 3)
+      add('QUEUE ≠ DELIVERY CONFIRMATION')
+      actionLabel(['APPROVE & QUEUE', 'CANCEL'])
+      return finish()
     }
     if (state.screen === 'status') {
       const reply = state.reply
-      lines.push('REPLY STATUS')
+      add(`${badge} · REPLY STATUS`)
+      add(item.latest_reply ? `CASE · ${item.customer_label} · ${item.status.toUpperCase()}` : `CASE · ${item.customer_label}`)
+      divider()
       if (reply) {
         const presentation = presentReplyState(reply.state, item.channel)
-        lines.push(oneLine(presentation.label.toUpperCase()))
-        lines.push(oneLine(presentation.detail))
-      } else lines.push('Checking latest reply…')
-      lines.push(actionLabel(['CHECK STATUS', 'RESOLVE CASE', 'BACK TO INBOX']))
-      return lines.join('\n')
+        add(presentation.label.toUpperCase())
+        add(`CHANNEL · ${item.channel.toUpperCase()}`)
+        add(presentation.detail, 2)
+      } else add('CHECKING LATEST REPLY…')
+      actionLabel(['CHECK STATUS', 'RESOLVE CASE', 'BACK TO INBOX'])
+      return finish()
     }
     if (state.screen === 'resolve') {
-      lines.push(`RESOLVE CASE · v${item.version}`)
-      lines.push(oneLine(item.customer_label))
-      if (item.latest_reply?.state === 'unknown') lines.push('UNCERTAIN · CUSTOMER MAY HAVE RECEIVED')
-      else if (item.latest_reply?.state === 'queued') lines.push('QUEUED REPLY WILL BE CANCELLED')
-      else if (item.latest_reply?.state === 'sending') lines.push('REPLY SENDING · WAIT')
-      else lines.push(oneLine(state.resolveReason.replaceAll('_', ' ').toUpperCase()))
-      lines.push(actionLabel(item.latest_reply?.state === 'unknown' && !state.acknowledgedUnknown
-        ? ['ACKNOWLEDGEMENT REQUIRED', 'CANCEL']
-        : ['RESOLVE CASE', 'CANCEL']))
-      return lines.join('\n')
+      add(`${badge} · RESOLVE CASE`)
+      add(`${item.customer_label} · ${item.status.toUpperCase()} · v${item.version}`)
+      divider()
+      add(`REASON · ${state.resolveReason.replaceAll('_', ' ').toUpperCase()}`)
+      if (item.latest_reply?.state === 'unknown') add('UNCERTAIN · CUSTOMER MAY HAVE RECEIVED', 2)
+      else if (item.latest_reply?.state === 'queued') add('QUEUED REPLY · WILL CANCEL BEFORE RESOLVE')
+      else if (item.latest_reply?.state === 'sending') add('REPLY SENDING · WAIT BEFORE RESOLVE')
+      const actions = item.latest_reply?.state === 'unknown' && !state.acknowledgedUnknown
+        ? ['ACKNOWLEDGE & RESOLVE', 'CANCEL']
+        : ['RESOLVE CASE', 'CANCEL']
+      actionLabel(actions)
+      add(`NEXT · ${actions[(state.focusedAction + 1) % actions.length]}`)
+      add('CLICK · NEXT ACTION  DOUBLE-CLICK · SELECT')
+      return finish()
     }
-    return lines.join('\n')
+    add(badge)
+    return finish()
   }
 
   private wrapText(value: string, width: number, maxLines: number): string[] {
-    const words = value.replace(/\s+/g, ' ').trim().split(' ')
+    const words = value.replace(/\s+/g, ' ').trim().split(' ').flatMap((word) => {
+      const chars = [...word]
+      if (chars.length <= width) return [word]
+      const pieces: string[] = []
+      for (let offset = 0; offset < chars.length; offset += width) pieces.push(chars.slice(offset, offset + width).join(''))
+      return pieces
+    })
     const output: string[] = []
     let line = ''
     for (const word of words) {
       const next = line ? `${line} ${word}` : word
-      if (next.length > width && line) {
+      if ([...next].length > width && line) {
         output.push(line)
         line = word
       } else line = next
@@ -1771,7 +1951,7 @@ export class GlanceAppController {
     if (line) output.push(line)
     if (output.length > maxLines) {
       output.length = maxLines
-      output[maxLines - 1] = `${output[maxLines - 1].slice(0, width - 1)}…`
+      output[maxLines - 1] = `${[...output[maxLines - 1]].slice(0, width - 1).join('')}…`
     }
     return output
   }

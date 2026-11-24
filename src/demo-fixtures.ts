@@ -1,6 +1,7 @@
 import { ApiError } from './client.ts'
 import type {
   CaseData,
+  CaseStatusData,
   DraftData,
   InboxData,
   InboxItem,
@@ -172,6 +173,20 @@ export class DemoFixtures {
     const item = this.cases.get(caseId)
     if (!item) throw new ApiError('case_not_found', 404, 'Synthetic case not found.')
     return { ...item, context: [...item.context], latest_reply: item.latest_reply ? { ...item.latest_reply } : null }
+  }
+
+  async getCaseStatus(caseId: string): Promise<CaseStatusData> {
+    const item = this.cases.get(caseId)
+    if (!item) throw new ApiError('case_not_found', 404, 'Synthetic case not found.')
+    return {
+      case_id: item.case_id,
+      status: item.status,
+      version: item.version,
+      latest_reply: item.latest_reply
+        ? { reply_id: item.latest_reply.reply_id, state: item.latest_reply.state, updated_at: item.latest_reply.updated_at }
+        : null,
+      case_updated_at: item.context.at(-1)?.created_at ?? new Date().toISOString(),
+    }
   }
 
   async transcribeAudio(_pcm: Uint8Array): Promise<TranscriptionData> {
