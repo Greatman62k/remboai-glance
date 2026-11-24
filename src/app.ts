@@ -2,7 +2,7 @@ import { EventSourceType } from '@evenrealities/even_hub_sdk'
 import { GlanceApiClient, ApiError, userMessageForError, type GlanceApi } from './client.ts'
 import { DEMO_FIXTURES_ENABLED } from './config.ts'
 import { DemoFixtures } from './demo-fixtures.ts'
-import { RING_EVENT_SOURCE, type GlanceInput } from './evenhub-events.ts'
+import { PhysicalPressDeduplicator, RING_EVENT_SOURCE, type GlanceInput } from './evenhub-events.ts'
 import { AudioCaptureError, G2PcmCapture, type AudioInputControl, type CaptureStopReason, type CaptureStopRequest } from './audio-capture.ts'
 import { DEVICE_LABEL, SessionStore, isValidPairingCode, normalizePairingCode } from './session.ts'
 import { canUseTranscriptAsInstruction, useTranscriptAsInstruction, useTranscriptAsReply } from './voice-intents.ts'
@@ -13,6 +13,7 @@ import type {
   ResolveRequest,
 } from './types.ts'
 import type { AppStateView, GlanceScreen } from './state-view.ts'
+import { buildGlassesPage, glassesPageText, type GlassesPage } from './glasses-ui.ts'
 import {
   IdempotencyKeyBook,
   categoryLabel,
@@ -130,7 +131,8 @@ export class GlanceAppController {
   private readonly voiceKeys = new IdempotencyKeyBook(null)
   private readonly voiceCapture = new G2PcmCapture()
   private readonly root: HTMLElement
-  private glassesWriter: ((text: string) => void) | null = null
+  private glassesWriter: ((page: GlassesPage) => void) | null = null
+  private readonly physicalPresses = new PhysicalPressDeduplicator()
   private audioControl: AudioInputControl | null = null
   private replyTimer: number | null = null
   private pollTimer: number | null = null
@@ -160,8 +162,12 @@ export class GlanceAppController {
     this.root.addEventListener('change', (event) => this.handleChange(event))
     this.root.addEventListener('submit', (event) => void this.handleSubmit(event))
     document.addEventListener('visibilitychange', this.visibilityHandler)
-    this.pollTimer = window.setInterval(() => void this.pollVisibleState(), 5_000)
 
+    if (this.state.fixtureMode) {
+      this.render()
+      return
+    }
+    this.pollTimer = window.setInterval(() => void this.pollVisibleState(), 5_000)
     const session = this.sessions.load()
     if (!session) {
       this.render()
@@ -175,7 +181,7 @@ export class GlanceAppController {
     await this.loadInbox()
   }
 
-  setGlassesWriter(writer: (text: string) => void): void {
+  setGlassesWriter(writer: (page: GlassesPage) => void): void {
     this.glassesWriter = writer
     this.updateGlasses()
   }
@@ -193,6 +199,13 @@ export class GlanceAppController {
     this.audioControl = control
   }
 
+  enableSyntheticPreview(): void {
+    this.fixtures.startDemo()
+    this.api = this.fixtures
+    this.state.fixtureMode = true
+    this.state.sessionPresent = false
+  }
+
   async dispose(): Promise<void> {
     document.removeEventListener('visibilitychange', this.visibilityHandler)
     if (this.pollTimer !== null) window.clearInterval(this.pollTimer)
@@ -203,6 +216,7 @@ export class GlanceAppController {
     this.keys.clear()
     this.voiceKeys.clear()
     this.voiceDerivedDraftIds.clear()
+    this.physicalPresses.clear()
     this.glassesWriter = null
     this.audioControl = null
   }
@@ -599,12 +613,26 @@ export class GlanceAppController {
       return
     }
     if (input.source !== null && input.source !== RING_EVENT_SOURCE && input.source !== EventSourceType.TOUCH_EVENT_FROM_GLASSES_R) return
+    if (!this.physicalPresses.accept(input)) return
+
+    if (this.state.screen === 'inbox' && 'selectedIndex' in input && input.selectedIndex !== undefined) {
+      const count = this.state.inbox?.items.length ?? 0
+      if (count > 0 && Number.isInteger(input.selectedIndex) && input.selectedIndex >= 0 && input.selectedIndex < count) {
+        this.state.selectedIndex = input.selectedIndex
+      }
+    } else if (this.state.screen === 'inbox' && 'selectedItemName' in input && input.selectedItemName) {
+      const items = this.state.inbox?.items ?? []
+      const index = items.findIndex((item) => input.selectedItemName?.startsWith(item.customer_label))
+      if (index >= 0) this.state.selectedIndex = index
+    }
 
     if (input.kind === 'scroll_up' || input.kind === 'scroll_down') {
       const delta = input.kind === 'scroll_down' ? 1 : -1
       if (this.state.screen === 'inbox') {
         const count = this.state.inbox?.items.length ?? 0
-        if (count) this.state.selectedIndex = (this.state.selectedIndex + delta + count) % count
+        if (count && (!('selectedIndex' in input) || input.selectedIndex === undefined)) {
+          this.state.selectedIndex = (this.state.selectedIndex + delta + count) % count
+        }
       } else if (this.state.screen === 'case' && this.state.caseData) {
         const pages = Math.max(1, Math.ceil(this.state.caseData.context.length / 3))
         this.state.messagePage = Math.min(pages - 1, Math.max(0, this.state.messagePage + delta))
@@ -1552,7 +1580,11 @@ export class GlanceAppController {
         if (selected === 1) { this.state.screen = 'case'; this.render(); return }
         break
       case 'approval':
-        if (selected === 0) return this.approveExactText()
+        if (selected === 0) {
+          this.state.message = 'Review and approve the exact outgoing text on the paired phone.'
+          this.render()
+          return
+        }
         if (selected === 1) { this.state.screen = 'draft'; this.render(); return }
         break
       case 'status':
@@ -1760,199 +1792,13 @@ export class GlanceAppController {
     return false
   }
 
+  getGlassesPage(): GlassesPage {
+    return buildGlassesPage(this.state)
+  }
+
   private updateGlasses(): void {
-    const text = this.buildGlassesText()
-    this.lastRenderedGlasses = text
-    this.glassesWriter?.(text)
-  }
-
-  private buildGlassesText(): string {
-    const state = this.state
-    const badge = state.fixtureMode ? 'GLANCE · SYNTHETIC' : 'REMBOAI GLANCE'
-    const lines: string[] = []
-    const item = state.caseData
-    // SDK 0.0.16 exposes a fixed firmware text style and left alignment only.
-    // The full 576 px canvas fits about 56 average-width glyphs at the native
-    // font; keep a little safety margin for wide letters and the 12 px inset.
-    const width = 56
-    const add = (text: string, maxLines = 1) => lines.push(...this.wrapText(text, width, maxLines))
-    const actionLabel = (labels: string[]) => add(`› ${labels[state.focusedAction % labels.length]} · DOUBLE-CLICK`)
-    // Firmware renders text at a fixed size. A short ASCII rule creates a
-    // stable section break without the unexpectedly wide box-drawing glyphs.
-    const divider = () => add('--------------------------------')
-    const finish = () => lines.slice(0, 9).join('\n')
-
-    if (state.screen === 'pair') {
-      add(`${badge} · PAIRING`)
-      add('OWNER SETUP · PAIRED PHONE')
-      divider()
-      add('Pairing code arrives in Telegram.')
-      add('Enter it in the paired phone WebView.')
-      add('One-time code · expires in 5 minutes.')
-      add('The code is never shown on G2.')
-      return finish()
-    }
-    if (state.screen === 'inbox') {
-      const items = state.inbox?.items ?? []
-      const selected = items[state.selectedIndex]
-      if (!selected) {
-        add(`${badge} · INBOX`)
-        add(`${state.inbox?.open_count ?? 0} OPEN CASES`)
-        divider()
-        add(state.connection === 'loading' ? 'Checking for owner escalations…' : state.connection === 'offline' ? 'Inbox is unavailable offline.' : 'You are all caught up.')
-        add(state.connection === 'offline' ? 'Reconnect from the paired phone.' : 'Refresh from the paired phone.')
-        return finish()
-      }
-      const position = `CASE ${state.selectedIndex + 1}/${items.length}${state.inbox?.has_more ? '+' : ''}`
-      const channel = selected.channel === 'telegram' ? 'TELEGRAM' : 'WHATSAPP'
-      add(`${badge} · INBOX${state.inboxStale ? ' · STALE' : ''}`)
-      add(`${state.inbox?.open_count ?? items.length} OPEN · ${position}`)
-      divider()
-      add(`SELECTED · ${selected.customer_label} / ${channel}`)
-      add(`${categoryLabel(selected.category).toUpperCase()} · ${this.age(selected.created_at)} WAITING`)
-      add(`LATEST · ${selected.preview}`)
-      if (items.length > 1) {
-        const next = items[(state.selectedIndex + 1) % items.length]
-        add(`NEXT · ${next.customer_label} / ${categoryLabel(next.category).toUpperCase()}`)
-        add(`LATEST · ${next.preview}`)
-      }
-      add('SCROLL CASES · DOUBLE-CLICK OPEN')
-      return finish()
-    }
-    if (!item) return `${badge}\nLOADING CASE…`
-
-    if (state.screen === 'case') {
-      const channel = item.channel === 'telegram' ? 'TG' : 'WA'
-      add(`${badge} · CASE DETAIL`)
-      add(`${item.customer_label} · ${categoryLabel(item.category).toUpperCase()}`)
-      add(`${item.status.toUpperCase()} · ${channel} · VERSION ${item.version}`)
-      divider()
-      if (item.status === 'resolved') {
-        add(`LATEST REPLY · ${item.latest_reply ? presentReplyState(item.latest_reply.state, item.channel).label.toUpperCase() : 'NONE'}`)
-        actionLabel(item.latest_reply ? ['CHECK REPLY STATUS', 'BACK TO INBOX'] : ['BACK TO INBOX', 'BACK TO INBOX'])
-        add('CLICK · CHANGE ACTION  DOUBLE-CLICK · OPEN')
-        return finish()
-      }
-      const chunk = messagePage(item.context, state.messagePage, 3)
-      const pages = Math.max(1, Math.ceil(item.context.length / 3))
-      add(`CONVERSATION · ${state.messagePage + 1}/${pages}${item.has_earlier ? ' · EARLIER OMITTED' : ''}`)
-      if (chunk.length) {
-        for (const message of chunk) {
-          const actor = message.actor === 'customer' ? 'CUST' : message.actor === 'assistant' ? 'AI' : 'OWNER'
-          add(`${actor} · ${message.text}`)
-        }
-      } else add(`LATEST · ${this.caseSummary(item)}`)
-      actionLabel(['GENERATE AI DRAFT', 'WRITE REPLY', 'VOICE CAPTURE', 'CHECK REPLY', 'RESOLVE CASE', 'BACK TO INBOX'])
-      return finish()
-    }
-    if (state.screen === 'voice') {
-      add(`${badge} · VOICE CAPTURE`)
-      divider()
-      if (state.voicePhase === 'recording') {
-        add(state.voiceSimulation ? 'SIMULATION · MICROPHONE OFF' : '● G2 MICROPHONE ACTIVE')
-        add(`DURATION · ${this.formatDuration(state.voiceDurationMs)} / 0:40`)
-        add(state.voiceSimulation ? 'NO AUDIO CAPTURED · NO ASR' : 'PCM · MEMORY ONLY')
-        const actions = [state.voiceSimulation ? 'FINISH PREVIEW' : 'STOP & TRANSCRIBE', 'CANCEL']
-        actionLabel(actions)
-        add(`NEXT · ${actions[(state.focusedAction + 1) % actions.length]}`)
-        add('CLICK · NEXT ACTION  DOUBLE-CLICK · SELECT')
-      } else if (state.voicePhase === 'transcript_ready') {
-        add(state.voiceSimulation ? 'SIMULATED · NOT SENT · NO ASR' : 'TRANSCRIPT · NOT SENT')
-        add(`CAPTURED ${this.formatDuration(state.voiceDurationMs)} · ASR ${state.voiceTranscriptionDurationMs ?? 0}MS`)
-        add('TRANSCRIPT PREVIEW')
-        add(state.voiceTranscript, 2)
-        add('PHONE · CHOOSE REPLY OR INSTRUCTION')
-        actionLabel(['OPEN PHONE REVIEW', 'BACK TO CASE'])
-      } else if (state.voicePhase === 'error') {
-        add('CAPTURE STOPPED · NO AUDIO RETAINED')
-        add(state.voiceError || 'TRY AGAIN ON PHONE', 2)
-        actionLabel(['RECORD AGAIN', 'BACK TO CASE'])
-      } else {
-        const phaseLabel = state.voicePhase === 'starting' ? 'MICROPHONE STARTING' : state.voicePhase === 'stopping' ? 'STOPPING MICROPHONE' : state.voicePhase === 'transcribing' ? 'TRANSCRIBING' : 'READY · OWNER STARTED'
-        add(phaseLabel)
-        add(state.voicePhase === 'transcribing' ? `RECORDING · ${this.formatDuration(state.voiceDurationMs)} · MEMORY ONLY` : 'G2 MICROPHONE · EXPLICIT START')
-        add(state.voicePhase === 'transcribing' ? 'WAITING FOR TRANSCRIPT' : 'FULL TRANSCRIPT ON PHONE')
-        if (state.voicePhase === 'idle') actionLabel(['START RECORDING', 'BACK TO CASE'])
-      }
-      return finish()
-    }
-    if (state.screen === 'draft') {
-      add(`${state.fixtureMode ? 'SYNTHETIC PREVIEW · NOT AI' : state.draft?.source === 'owner' ? 'OWNER DRAFT · NOT SENT' : 'AI SUGGESTION · NOT SENT'}`)
-      add('DRAFT · OWNER REVIEW REQUIRED')
-      divider()
-      add(`CASE v${item.version} · DRAFT BASE v${state.draft?.based_on_version ?? item.version}`)
-      add('CUSTOMER REPLY · PREVIEW')
-      add(state.editorText || state.draft?.text || 'Write a reply on your phone.', 2)
-      add('PHONE · EDIT COMPLETE CUSTOMER TEXT')
-      actionLabel(['REVIEW EXACT TEXT', 'BACK TO CASE'])
-      return finish()
-    }
-    if (state.screen === 'approval') {
-      add('FINAL REVIEW · EXACT CUSTOMER TEXT')
-      add('OWNER INSPECTED FULL TEXT ON PHONE')
-      divider()
-      add('MESSAGE PREVIEW · NOT YET QUEUED')
-      add(state.approvalText, 3)
-      add('QUEUE ≠ DELIVERY CONFIRMATION')
-      actionLabel(['APPROVE & QUEUE', 'CANCEL'])
-      return finish()
-    }
-    if (state.screen === 'status') {
-      const reply = state.reply
-      add(`${badge} · REPLY STATUS`)
-      add(item.latest_reply ? `CASE · ${item.customer_label} · ${item.status.toUpperCase()}` : `CASE · ${item.customer_label}`)
-      divider()
-      if (reply) {
-        const presentation = presentReplyState(reply.state, item.channel)
-        add(presentation.label.toUpperCase())
-        add(`CHANNEL · ${item.channel.toUpperCase()}`)
-        add(presentation.detail, 2)
-      } else add('CHECKING LATEST REPLY…')
-      actionLabel(['CHECK STATUS', 'RESOLVE CASE', 'BACK TO INBOX'])
-      return finish()
-    }
-    if (state.screen === 'resolve') {
-      add(`${badge} · RESOLVE CASE`)
-      add(`${item.customer_label} · ${item.status.toUpperCase()} · v${item.version}`)
-      divider()
-      add(`REASON · ${state.resolveReason.replaceAll('_', ' ').toUpperCase()}`)
-      if (item.latest_reply?.state === 'unknown') add('UNCERTAIN · CUSTOMER MAY HAVE RECEIVED', 2)
-      else if (item.latest_reply?.state === 'queued') add('QUEUED REPLY · WILL CANCEL BEFORE RESOLVE')
-      else if (item.latest_reply?.state === 'sending') add('REPLY SENDING · WAIT BEFORE RESOLVE')
-      const actions = item.latest_reply?.state === 'unknown' && !state.acknowledgedUnknown
-        ? ['ACKNOWLEDGE & RESOLVE', 'CANCEL']
-        : ['RESOLVE CASE', 'CANCEL']
-      actionLabel(actions)
-      add(`NEXT · ${actions[(state.focusedAction + 1) % actions.length]}`)
-      add('CLICK · NEXT ACTION  DOUBLE-CLICK · SELECT')
-      return finish()
-    }
-    add(badge)
-    return finish()
-  }
-
-  private wrapText(value: string, width: number, maxLines: number): string[] {
-    const words = value.replace(/\s+/g, ' ').trim().split(' ').flatMap((word) => {
-      const chars = [...word]
-      if (chars.length <= width) return [word]
-      const pieces: string[] = []
-      for (let offset = 0; offset < chars.length; offset += width) pieces.push(chars.slice(offset, offset + width).join(''))
-      return pieces
-    })
-    const output: string[] = []
-    let line = ''
-    for (const word of words) {
-      const next = line ? `${line} ${word}` : word
-      if ([...next].length > width && line) {
-        output.push(line)
-        line = word
-      } else line = next
-    }
-    if (line) output.push(line)
-    if (output.length > maxLines) {
-      output.length = maxLines
-      output[maxLines - 1] = `${[...output[maxLines - 1]].slice(0, width - 1).join('')}…`
-    }
-    return output
+    const page = this.getGlassesPage()
+    this.lastRenderedGlasses = glassesPageText(page)
+    this.glassesWriter?.(page)
   }
 }

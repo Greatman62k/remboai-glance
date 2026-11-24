@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { AudioInputSource } from '@evenrealities/even_hub_sdk'
 import { DemoFixtures, FIXTURE_CASE_ID, FIXTURE_UNKNOWN_CASE_ID } from '../src/demo-fixtures.ts'
-import { parseEvenHubEvent } from '../src/evenhub-events.ts'
+import { parseEvenHubEvent, PhysicalPressDeduplicator } from '../src/evenhub-events.ts'
 import {
   IdempotencyKeyBook,
   caseIsStale,
@@ -82,16 +82,32 @@ test('reply labels preserve provider acceptance versus delivery and bounded poll
 })
 
 test('Even Hub envelope parser distinguishes click, scroll, double-click, and lifecycle events', () => {
-  const click = parseEvenHubEvent({ type: 'sys_event', data: { eventSource: 1 } })
-  const scroll = parseEvenHubEvent({ type: 'sys_event', data: { eventType: 1, eventSource: 2 } })
-  const double = parseEvenHubEvent({ type: 'sys_event', data: { eventType: 3, eventSource: 2 } })
-  const foreground = parseEvenHubEvent({ type: 'sys_event', data: { eventType: 5, eventSource: 2 } })
+  const click = parseEvenHubEvent({ sysEvent: { eventSource: 1 } })
+  const explicitZeroClick = parseEvenHubEvent({ textEvent: { containerID: 2, eventType: 0 } })
+  const listClick = parseEvenHubEvent({ listEvent: { containerID: 2, currentSelectItemIndex: 0 } })
+  const selectedDoubleClick = parseEvenHubEvent({
+    sysEvent: { eventType: 3, eventSource: 1 },
+    listEvent: { containerID: 2, currentSelectItemIndex: 2, currentSelectItemName: 'Kendi' },
+  })
+  const scroll = parseEvenHubEvent({ sysEvent: { eventType: 1, eventSource: 2 } })
+  const double = parseEvenHubEvent({ sysEvent: { eventType: 3, eventSource: 2 } })
+  const foreground = parseEvenHubEvent({ sysEvent: { eventType: 5, eventSource: 2 } })
   const sdkEnvelope = parseEvenHubEvent({ jsonData: { containerID: 2, containerName: 'text-1', eventType: 2 }, textEvent: { containerID: 2, containerName: 'text-1', eventType: 2 } })
   assert.equal(click?.kind, 'click')
+  assert.equal(explicitZeroClick?.kind, 'click')
+  assert.equal(listClick?.kind, 'click')
+  if (listClick?.kind === 'click') assert.equal(listClick.selectedIndex, 0)
+  assert.equal(selectedDoubleClick?.kind, 'double_click')
+  if (selectedDoubleClick?.kind === 'double_click') {
+    assert.equal(selectedDoubleClick.selectedIndex, 2)
+    assert.equal(selectedDoubleClick.selectedItemName, 'Kendi')
+  }
   assert.equal(scroll?.kind, 'scroll_up')
   assert.equal(double?.kind, 'double_click')
   assert.equal(foreground?.kind, 'foreground_exit')
   assert.equal(sdkEnvelope?.kind, 'scroll_down')
+  assert.equal(parseEvenHubEvent({ textEvent: {} }), null)
+  assert.equal(parseEvenHubEvent({ sysEvent: {} }), null)
   assert.equal(parseEvenHubEvent({}), null)
 
   const pcm = new Uint8Array([1, 2, 3, 4])
@@ -101,6 +117,17 @@ test('Even Hub envelope parser distinguishes click, scroll, double-click, and li
     assert.equal(audio.source, AudioInputSource.Glasses)
     assert.equal(audio.pcm, pcm)
   }
+})
+
+test('physical press deduplication drops cross-envelope echoes but preserves same-envelope presses', () => {
+  const dedupe = new PhysicalPressDeduplicator(1_200)
+  const systemClick = { kind: 'click', source: null, envelope: 'sysEvent' } as const
+  const textClick = { kind: 'click', source: null, envelope: 'textEvent' } as const
+  assert.equal(dedupe.accept(systemClick, 1_000), true)
+  assert.equal(dedupe.accept(systemClick, 1_100), true)
+  assert.equal(dedupe.accept(textClick, 1_200), false)
+  assert.equal(dedupe.accept(textClick, 1_300), true)
+  assert.equal(dedupe.accept(systemClick, 2_600), true)
 })
 
 test('synthetic inbox and detail fixtures are clearly isolated and include look-ahead context', async () => {

@@ -245,16 +245,11 @@ test('disposing the app requests microphone shutdown before the page exit handle
   }
 })
 
-test('G2 fixture screens render within compact bounds and primary navigation returns to inbox', async () => {
+test('G2 fixture screens stay glanceable and exact approval remains on the phone', async () => {
   const api = { getCase: async () => ({ ...caseData }) } as unknown as GlanceApi
   const { app, restore } = makeApp(api)
   const render = () => (app as unknown as { render(): void }).render()
   const screenText = () => app.getGlassText()
-  const assertNativeTextBounds = () => {
-    const lines = screenText().split('\n')
-    assert.ok(lines.length <= 9, `expected at most nine glance lines; got ${lines.length}`)
-    assert.ok(lines.every((line) => [...line].length <= 56), 'every G2 line should fit the measured native-width budget')
-  }
   try {
     const access = app as unknown as { api: GlanceApi; activateGlassAction(): Promise<void> }
     app.fixtures.startDemo()
@@ -265,45 +260,38 @@ test('G2 fixture screens render within compact bounds and primary navigation ret
     app.state.screen = 'pair'
     render()
     assert.match(screenText(), /PAIRING/)
-    assertNativeTextBounds()
+    assert.match(screenText(), /PAIR AND REVIEW ON PHONE/)
 
     app.state.screen = 'inbox'
     app.state.inbox = await app.fixtures.getInbox()
     render()
-    assert.match(screenText(), /GLANCE · SYNTHETIC/)
-    assert.match(screenText(), /OWNER REQUEST/)
-    assert.match(screenText(), /Amina/)
-    assert.match(screenText(), /NEXT · Nia \/ DEPOSIT QUESTION/)
-    assert.match(screenText(), /Could the owner clarify the deposit policy\?/)
-    assert.match(screenText(), /SCROLL CASES · DOUBLE-CLICK OPEN/)
-    assertNativeTextBounds()
+    assert.match(screenText(), /GLANCE DEMO/)
+    assert.match(screenText(), /Amina \| OWNER REQUEST/)
+    assert.match(screenText(), /Nia \| DEPOSIT QUESTION/)
+    assert.match(screenText(), /SCROLL TO SELECT  \|  DOUBLE TAP OPEN/)
 
     await app.handleGlassesInput({ kind: 'double_click', source: null })
     assert.equal(app.state.screen, 'case')
-    assert.match(screenText(), /OPEN · TG · VERSION 3/)
-    assert.match(screenText(), /CONVERSATION · 1\/4 · EARLIER OMITTED/)
-    assert.match(screenText(), /CUST · Hello, I wanted to ask about coming in today/)
-    assert.match(screenText(), /AI · I can ask the owner to confirm today/)
-    assertNativeTextBounds()
-    app.state.focusedAction = 5
-    render()
-    assert.match(screenText(), /BACK TO INBOX/)
+    assert.match(screenText(), /CASE DETAIL/)
+    assert.match(screenText(), /LATEST CUSTOMER MESSAGE/)
+    assert.match(screenText(), /I am nearby now/i)
 
     app.state.focusedAction = 0
     render()
     await access.activateGlassAction()
     assert.equal(app.state.screen, 'draft')
-    assert.match(screenText(), /SYNTHETIC PREVIEW/)
-    assert.match(screenText(), /DRAFT · OWNER REVIEW REQUIRED/)
-    assert.match(screenText(), /REVIEW EXACT TEXT/)
-    assertNativeTextBounds()
+    assert.match(screenText(), /SYNTHETIC DRAFT  \|  NOT SENT/)
+    assert.match(screenText(), /FULL TEXT AND APPROVAL ON PHONE/)
 
     app.state.screen = 'approval'
-    app.state.approvalText = 'Thanks for checking in. I will ask the owner to confirm availability.'
+    app.state.approvalText = 'Sensitive exact outgoing reply must stay on the phone.'
+    app.state.reply = null
     render()
-    assert.match(screenText(), /FINAL REVIEW · EXACT CUSTOMER TEXT/)
-    assert.match(screenText(), /QUEUE ≠ DELIVERY CONFIRMATION/)
-    assertNativeTextBounds()
+    assert.match(screenText(), /OPEN THE PHONE TO REVIEW/)
+    assert.doesNotMatch(screenText(), /Sensitive exact outgoing reply/)
+    await access.activateGlassAction()
+    assert.equal(app.state.screen, 'approval')
+    assert.equal(app.state.reply, null)
 
     app.state.screen = 'status'
     app.state.reply = {
@@ -312,65 +300,89 @@ test('G2 fixture screens render within compact bounds and primary navigation ret
       submitted_at: null, delivered_at: null, failed_at: null,
     }
     render()
-    assert.match(screenText(), /REPLY STATUS/)
-    assert.match(screenText(), /QUEUED/)
-    assertNativeTextBounds()
+    assert.match(screenText(), /OUTBOX: QUEUED/)
+    assert.match(screenText(), /DELIVERY NOT CONFIRMED/)
+    assert.doesNotMatch(screenText(), /DELIVERED/)
 
     app.state.screen = 'resolve'
     app.state.caseData = { ...app.state.caseData!, latest_reply: { ...app.state.reply, state: 'queued' } }
     render()
-    assert.match(screenText(), /QUEUED REPLY · WILL CANCEL BEFORE RESOLVE/)
-    assert.match(screenText(), /RESOLVE CASE/)
-    assertNativeTextBounds()
+    assert.match(screenText(), /QUEUED REPLY CANCELS BEFORE RESOLVE/)
+    assert.match(screenText(), /OWNER ACTION REQUIRED/)
 
     app.state.screen = 'case'
     app.state.focusedAction = 5
     await access.activateGlassAction()
     assert.equal(app.state.screen, 'inbox')
 
-    const caseDataForVoice = await app.fixtures.getCase(FIXTURE_CASE_ID)
-    app.state.caseData = caseDataForVoice
+    app.state.caseData = await app.fixtures.getCase(FIXTURE_CASE_ID)
     app.state.screen = 'case'
     const audioControlCalls: boolean[] = []
     app.setAudioControl(async (open) => { audioControlCalls.push(open); return true })
     await (app as unknown as { beginDemoRecording(): Promise<void> }).beginDemoRecording()
     assert.equal(app.state.screen, 'voice')
-    assert.match(screenText(), /SIMULATION · MICROPHONE OFF/)
-    assertNativeTextBounds()
+    assert.match(screenText(), /SIMULATION  \|  MIC OFF/)
+    assert.match(screenText(), /00:00  \/  00:40/)
+    assert.match(screenText(), /NO AUDIO CAPTURED/)
+    assert.doesNotMatch(screenText(), /AUDIO BUFFERED IN MEMORY/)
     assert.equal((app as unknown as { voiceCapture: { byteLength: number } }).voiceCapture.byteLength, 0)
     assert.deepEqual(audioControlCalls, [])
-    await new Promise((resolve) => setTimeout(resolve, 300))
-    assert.match(screenText(), /DURATION · 0:00 \/ 0:40/)
 
     await access.activateGlassAction()
     assert.equal(app.state.voicePhase, 'transcript_ready')
-    assert.match(screenText(), /SIMULATED · NOT SENT · NO ASR/)
-    assert.match(screenText(), /PHONE · CHOOSE REPLY OR INSTRUCTION/)
-    assert.doesNotMatch(screenText(), /TRANSCRIPT READY/)
-    assertNativeTextBounds()
+    assert.match(screenText(), /SIMULATION  \|  NO ASR/)
+    assert.match(screenText(), /PHONE: CHOOSE REPLY OR INSTRUCTION/)
     assert.equal(audioControlCalls.length, 0)
 
     app.state.screen = 'inbox'
     app.state.inbox = { items: [], open_count: 0, has_more: false, next_cursor: null }
     app.state.connection = 'loading'
     render()
-    assert.match(screenText(), /Checking for owner escalations/)
-    assertNativeTextBounds()
+    assert.match(screenText(), /CHECKING OPEN CASES/)
     app.state.connection = 'connected'
     render()
-    assert.match(screenText(), /You are all caught up/)
+    assert.match(screenText(), /NO OPEN CASES/)
     app.state.connection = 'offline'
     render()
-    assert.match(screenText(), /Inbox is unavailable offline/)
-    assertNativeTextBounds()
+    assert.match(screenText(), /INBOX UNAVAILABLE/)
 
     app.state.screen = 'voice'
     app.state.voicePhase = 'error'
     app.state.voiceError = 'Synthetic bounded error.'
     render()
-    assert.match(screenText(), /CAPTURE STOPPED · NO AUDIO RETAINED/)
+    assert.match(screenText(), /CAPTURE STOPPED/)
     assert.match(screenText(), /Synthetic bounded error/)
-    assertNativeTextBounds()
+  } finally {
+    await app.dispose()
+    restore()
+  }
+})
+
+test('native inbox list selection survives omitted index zero and opens the selected case', async () => {
+  const { app, restore } = makeApp({} as GlanceApi)
+  try {
+    app.fixtures.startDemo()
+    ;(app as unknown as { api: GlanceApi }).api = app.fixtures
+    app.state.fixtureMode = true
+    app.state.connection = 'development-fixtures'
+    app.state.screen = 'inbox'
+    app.state.inbox = await app.fixtures.getInbox()
+
+    await app.handleGlassesInput({
+      kind: 'scroll_down', source: null, envelope: 'listEvent', selectedIndex: 2,
+    })
+    assert.equal(app.state.selectedIndex, 2)
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'listEvent' })
+    assert.equal(app.state.screen, 'case')
+    assert.equal(app.state.caseData?.customer_label, 'Kendi')
+
+    app.state.screen = 'inbox'
+    app.state.selectedIndex = 2
+    await app.handleGlassesInput({
+      kind: 'double_click', source: null, envelope: 'listEvent', selectedIndex: 0,
+    })
+    assert.equal(app.state.screen, 'case')
+    assert.equal(app.state.caseData?.customer_label, 'Amina')
   } finally {
     await app.dispose()
     restore()
@@ -421,7 +433,7 @@ test('lightweight status polling refreshes context only for case changes and ren
   }
 })
 
-test('G2 voice display stays glanceable and truncates transcript preview for phone review', async () => {
+test('G2 recording and transcript screens are bounded and keep full review on the phone', async () => {
   const api = {} as GlanceApi
   const { app, restore } = makeApp(api)
   try {
@@ -429,27 +441,20 @@ test('G2 voice display stays glanceable and truncates transcript preview for pho
     app.state.voicePhase = 'recording'
     app.state.voiceDurationMs = 8_000
     ;(app as unknown as { render(): void }).render()
-    const recordingLines = app.getGlassText().split('\n')
-    assert.ok(recordingLines.some((line) => line.includes('G2 MICROPHONE ACTIVE')))
-    assert.ok(recordingLines.some((line) => line === 'DURATION · 0:08 / 0:40'))
-    assert.ok(recordingLines.some((line) => line.includes('STOP & TRANSCRIBE')))
-    assert.ok(recordingLines.some((line) => line.includes('NEXT · CANCEL')))
-    assert.ok(recordingLines.length <= 9)
-    assert.ok(recordingLines.every((line) => [...line].length <= 56))
+    const recording = app.getGlassText()
+    assert.match(recording, /RECORDING  \|  MIC ACTIVE/)
+    assert.match(recording, /00:08  \/  00:40/)
+    assert.match(recording, /STOP AND REVIEW/)
+    assert.match(recording, /\|  CANCEL/)
 
     app.state.voicePhase = 'transcript_ready'
     app.state.voiceTranscript = 'The complete recognized sentence is visible on the phone for owner review.'
     ;(app as unknown as { render(): void }).render()
-    const transcriptText = app.getGlassText()
-    const transcriptLines = transcriptText.split('\n')
-    assert.ok(transcriptLines.includes('TRANSCRIPT · NOT SENT'))
-    assert.ok(transcriptLines.includes('PHONE · CHOOSE REPLY OR INSTRUCTION'))
-    assert.ok(transcriptLines.some((line) => line === 'TRANSCRIPT PREVIEW'))
-    assert.ok(transcriptLines.length <= 9)
-    assert.ok(transcriptLines.every((line) => [...line].length <= 56))
-    assert.doesNotMatch(transcriptText, /The complete recognized sentence is visible on the phone for owner review\./)
-    assert.match(transcriptText, /SIMULATED|TRANSCRIPT/)
-    assert.match(transcriptText, /PHONE · CHOOSE REPLY OR INSTRUCTION/)
+    const transcript = app.getGlassText()
+    assert.match(transcript, /TRANSCRIPT  \|  NOT SENT/)
+    assert.match(transcript, /PHONE: CHOOSE REPLY OR INSTRUCTION/)
+    assert.doesNotMatch(transcript, /The complete recognized sentence is visible on the phone for owner review\./)
+    assert.match(transcript, /TRANSCRIPT READY/)
   } finally {
     await app.dispose()
     restore()

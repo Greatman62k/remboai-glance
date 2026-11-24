@@ -45,11 +45,20 @@ To open the running Vite app in the Even Hub simulator:
 evenhub-simulator http://127.0.0.1:5173 --automation-port 9898 --no-glow
 ```
 
-The simulator exposes a 576 × 288 G2 display. The SDK text container is positioned within that display; use the phone WebView for longer text and forms. Scroll navigates cases or context chunks, click changes the highlighted G2 action, and double-click activates it. The app does not rely on long press or programmatic display scrolling.
+The simulator exposes a 576 × 288 G2 display. Its `/api/ping` endpoint only means the simulator process is ready; it does not mean the WebView, Even Hub bridge, startup page, or framebuffer is ready. Wait until the phone WebView reports `Even Hub display connected · 576 × 288` or the glasses screenshot contains a nontransparent frame before capturing. This prevents a screenshot taken during startup from being mistaken for a blank app page.
+
+In a development build, render the eight synthetic G2 screens by adding `?g2-preview=` to the simulator URL: `inbox`, `case`, `draft`, `voice-ready`, `voice-recording`, `transcript-preview`, `reply-status`, or `case-resolved`. For example:
+
+```sh
+evenhub-simulator 'http://127.0.0.1:5173/?g2-preview=voice-recording' --automation-port 9898 --no-glow
+```
+
+These routes use local synthetic fixtures, skip saved-session loading and backend polling, and never start the microphone. The recording screen is labeled `SIMULATION | MIC OFF`. Scroll navigates cases or list items, click changes the focused action, and double-click activates it. Full transcript review, draft editing, intent selection and exact outgoing-message approval stay on the phone.
 
 ## Architecture
 
-- `src/main.ts` waits for the Even Hub bridge, creates the text container and forwards SDK events.
+- `src/main.ts` waits for the Even Hub bridge, validates and creates/rebuilds native pages, upgrades stable text containers, and forwards SDK events through one shared handler.
+- `src/glasses-ui.ts` builds bounded native 576 × 288 screen layouts using absolute SDK container geometry.
 - `src/app.ts` coordinates pairing, inbox, case, voice, draft, approval, reply-status and resolution screens.
 - `src/client.ts` implements the typed `/api/v1/glance` requests, including authenticated raw PCM transcription, bearer handling, timeouts, request IDs, `Retry-After`, and no-store fetches.
 - `src/session.ts` validates pairing codes and stores the revocable session token in browser `localStorage` until expiry or revocation.
