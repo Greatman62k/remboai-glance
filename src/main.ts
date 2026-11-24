@@ -9,18 +9,26 @@ import {
 } from '@evenrealities/even_hub_sdk'
 import { API_BASE } from './config.ts'
 import { GlanceAppController } from './app.ts'
+import { LatestOnlyDisplayWriter } from './display-writer.ts'
 import { parseEvenHubEvent } from './evenhub-events.ts'
-import {
-  glassesPageToPayload,
-  glassesPagesHaveSameLayout,
-  type GlassesPage,
-} from './glasses-ui.ts'
+import { glassesPageToPayload, glassesPagesHaveSameLayout, type GlassesPage } from './glasses-ui.ts'
+import { runtimeMetrics } from './runtime-metrics.ts'
 import './style.css'
 
 const appElement = document.querySelector<HTMLElement>('#app')
 if (!appElement) throw new Error('Glance app root is missing.')
 
 const app = new GlanceAppController(appElement, API_BASE)
+let performanceReportTimer: number | null = null
+
+function schedulePerformanceReport(): void {
+  if (!import.meta.env.DEV || performanceReportTimer !== null) return
+  performanceReportTimer = window.setTimeout(() => {
+    performanceReportTimer = null
+    // Counters contain only aggregate numbers; never report page or request content.
+    console.info('[Glance performance]', app.getRuntimeMetrics())
+  }, 1_000)
+}
 
 function validatePage(page: GlassesPage): void {
   const payload = glassesPageToPayload(page)
@@ -70,16 +78,20 @@ async function connectGlasses(): Promise<void> {
     const initialPage = app.getGlassesPage()
     validatePage(initialPage)
     const initialPayload = glassesPageToPayload(initialPage)
+    const startupStarted = typeof performance !== 'undefined' ? performance.now() : Date.now()
     const rawResult = await bridge.createStartUpPageContainer(
       new CreateStartUpPageContainer(initialPayload),
     )
+    const startupFinished = typeof performance !== 'undefined' ? performance.now() : Date.now()
     const result = StartUpPageCreateResult.normalize(rawResult)
+    if (result === StartUpPageCreateResult.success) runtimeMetrics.pageCreate(startupFinished - startupStarted)
     console.info('[G2] bridge ready; startup page result', result)
 
     let pageReady = result === StartUpPageCreateResult.success
     if (!pageReady && result === StartUpPageCreateResult.invalid) {
       // A WebView reload can retain a native page. Rebuild that page in place.
       pageReady = await bridge.rebuildPageContainer(new RebuildPageContainer(initialPayload))
+      if (pageReady) runtimeMetrics.pageRebuild()
       console.info('[G2] retained startup page rebuild result', pageReady)
     }
     if (!pageReady) {
@@ -94,8 +106,6 @@ async function connectGlasses(): Promise<void> {
     let writeFailed = false
     let deviceConnected = true
     let rebuildRequested = false
-    let writeSequence = 0
-    let displayQueue: Promise<void> = Promise.resolve()
     const failDisplay = (error: unknown) => {
       if (writeFailed) return
       writeFailed = true
@@ -103,42 +113,57 @@ async function connectGlasses(): Promise<void> {
       app.setGlassesAvailable(false)
       app.setGlassesStatus(`G2 display update failed (${detail}).`)
     }
-    const writePage = (page: GlassesPage) => {
-      const sequence = ++writeSequence
-      displayQueue = displayQueue.then(async () => {
-        if (writeFailed || !deviceConnected || sequence !== writeSequence) return
-        validatePage(page)
-        if (rebuildRequested || !glassesPagesHaveSameLayout(currentPage, page)) {
-          const updated = await bridge.rebuildPageContainer(
-            new RebuildPageContainer(glassesPageToPayload(page)),
-          )
-          if (!updated) throw new Error('G2 page rebuild was rejected.')
-          rebuildRequested = false
-        } else {
-          for (const container of page.textObject) {
-            const updated = await bridge.textContainerUpgrade(new TextContainerUpgrade({
-              containerID: container.containerID,
-              containerName: container.containerName,
-              content: container.content ?? '',
-              textColor: container.textColor,
-            }))
-            if (!updated) throw new Error('G2 text update was rejected.')
-          }
+    const displayWriter = new LatestOnlyDisplayWriter<GlassesPage>(async (page) => {
+      if (writeFailed || !deviceConnected) return
+      validatePage(page)
+      if (rebuildRequested || !glassesPagesHaveSameLayout(currentPage, page)) {
+        const updated = await bridge.rebuildPageContainer(new RebuildPageContainer(glassesPageToPayload(page)))
+        if (!updated) throw new Error('G2 page rebuild was rejected.')
+        runtimeMetrics.pageRebuild()
+        rebuildRequested = false
+      } else {
+        for (const container of page.textObject) {
+          const previous = currentPage.textObject.find((candidate) =>
+            candidate.containerID === container.containerID && candidate.containerName === container.containerName)
+          if (previous && previous.content === container.content && previous.textColor === container.textColor) continue
+          const updated = await bridge.textContainerUpgrade(new TextContainerUpgrade({
+            containerID: container.containerID,
+            containerName: container.containerName,
+            content: container.content ?? '',
+            textColor: container.textColor,
+          }))
+          if (!updated) throw new Error('G2 text update was rejected.')
+          runtimeMetrics.textUpdate()
         }
-        currentPage = page
-      }).catch(failDisplay)
-    }
+      }
+      currentPage = page
+      schedulePerformanceReport()
+    }, (left, right) => {
+      if (!glassesPagesHaveSameLayout(left, right)) return false
+      return JSON.stringify({
+        text: left.textObject.map((entry) => [entry.containerID, entry.content, entry.textColor]),
+        list: (left.listObject ?? []).map((entry) => entry.itemContainer?.itemName ?? []),
+        menu: left.menuObject?.menuItems ?? [],
+      }) === JSON.stringify({
+        text: right.textObject.map((entry) => [entry.containerID, entry.content, entry.textColor]),
+        list: (right.listObject ?? []).map((entry) => entry.itemContainer?.itemName ?? []),
+        menu: right.menuObject?.menuItems ?? [],
+      })
+    }, failDisplay, initialPage)
+    const writePage = (page: GlassesPage) => displayWriter.enqueue(page)
 
     app.setAudioControl((open, source) => open
       ? bridge.audioControl(true, source ?? AudioInputSource.Glasses)
       : bridge.audioControl(false))
     app.setGlassesAvailable(true)
     app.setGlassesWriter(writePage)
+    schedulePerformanceReport()
 
     const unsubscribeDeviceStatus = bridge.onDeviceStatusChanged((status) => {
       if (status.isDisconnected() || status.isConnectionFailed()) {
         deviceConnected = false
         rebuildRequested = true
+        displayWriter.invalidate()
         app.setGlassesAvailable(false)
         app.setGlassesStatus('G2 disconnected. Reconnect the glasses to continue.')
         return
@@ -147,6 +172,7 @@ async function connectGlasses(): Promise<void> {
         deviceConnected = true
         writeFailed = false
         rebuildRequested = true
+        displayWriter.recover()
         app.setGlassesAvailable(true)
         app.setGlassesStatus('G2 reconnected; restoring the display…')
         app.setGlassesWriter(writePage)
@@ -160,6 +186,8 @@ async function connectGlasses(): Promise<void> {
       if (parsed) void app.handleGlassesInput(parsed)
     })
     window.addEventListener('pagehide', () => {
+      if (performanceReportTimer !== null) window.clearTimeout(performanceReportTimer)
+      performanceReportTimer = null
       unsubscribe()
       unsubscribeDeviceStatus()
       void app.dispose()

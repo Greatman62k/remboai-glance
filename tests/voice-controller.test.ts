@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { AudioInputSource } from '@evenrealities/even_hub_sdk'
+import { AudioInputSource, EventSourceType, OsEventTypeList } from '@evenrealities/even_hub_sdk'
 import { ApiError, type GlanceApi } from '../src/client.ts'
 import { GlanceAppController } from '../src/app.ts'
 import { DemoFixtures, FIXTURE_CASE_ID } from '../src/demo-fixtures.ts'
@@ -21,6 +21,10 @@ function putGlobal(name: string, value: unknown): () => void {
     if (previous) Object.defineProperty(globalThis, name, previous)
     else Reflect.deleteProperty(globalThis, name)
   }
+}
+
+async function settleSingleClick(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 300))
 }
 
 const caseData: CaseData = {
@@ -71,7 +75,7 @@ function makeApp(api: GlanceApi) {
 
 async function startVoiceThroughG2(app: GlanceAppController): Promise<void> {
   app.state.screen = 'case'
-  app.state.focusedAction = 2
+  app.state.focusedAction = 1
   await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
   assert.equal(app.state.screen, 'voice')
   assert.equal(app.state.voicePhase, 'idle')
@@ -90,11 +94,12 @@ test('G2 voice-ready stays microphone-off until START and duplicate event paths 
 
   try {
     app.state.screen = 'case'
-    app.state.focusedAction = 2
+    app.state.focusedAction = 1
     await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
     assert.equal(app.state.screen, 'voice')
     assert.equal(app.state.voicePhase, 'idle')
     assert.match(app.getGlassText(), /MICROPHONE OFF/)
+    assert.match(app.getGlassText(), /> START  \|  BACK/)
     assert.deepEqual(audioCalls, [])
 
     const activating = app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
@@ -107,7 +112,7 @@ test('G2 voice-ready stays microphone-off until START and duplicate event paths 
     finishOpen(true)
     await activating
     assert.equal(app.state.voicePhase, 'recording')
-    assert.match(app.getGlassText(), /RECORDING  \|  MIC ACTIVE/)
+    assert.match(app.getGlassText(), /RECORDING  \|  G2 MIC ACTIVE/)
   } finally {
     await app.dispose()
     restore()
@@ -120,12 +125,69 @@ test('G2 voice-ready BACK returns to case without opening the microphone', async
   app.setAudioControl(async (open) => { audioCalls.push(open); return true })
   try {
     app.state.screen = 'case'
-    app.state.focusedAction = 2
+    app.state.focusedAction = 1
     await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
-    await app.handleGlassesInput({ kind: 'click', source: null, envelope: 'sysEvent' })
+    assert.match(app.getGlassText(), /> START  \|  BACK/)
+    await app.handleGlassesInput({ kind: 'scroll_down', source: null })
     assert.match(app.getGlassText(), /START  \|  > BACK/)
     await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
     assert.equal(app.state.screen, 'case')
+    assert.deepEqual(audioCalls, [])
+  } finally {
+    await app.dispose()
+    restore()
+  }
+})
+
+test('a click echo preceding double-click activates only the selected G2 action once', async () => {
+  const { app, restore } = makeApp({ getCase: async () => ({ ...caseData }) } as unknown as GlanceApi)
+  const audioCalls: boolean[] = []
+  app.setGlassesAvailable(true)
+  app.setAudioControl(async (open) => { audioCalls.push(open); return true })
+  try {
+    app.state.screen = 'voice'
+    app.state.voicePhase = 'idle'
+    const firstTap = parseEvenHubEvent({ textEvent: { containerID: 2, containerName: 'g2-main' } })
+    assert.equal(firstTap?.kind, 'click')
+    if (firstTap) await app.handleGlassesInput(firstTap)
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
+    assert.equal(app.state.voicePhase, 'recording')
+    assert.deepEqual(audioCalls, [true])
+  } finally {
+    await app.dispose()
+    restore()
+  }
+})
+
+test('long press and release are not mistaken for microphone activation', async () => {
+  const { app, restore } = makeApp({ getCase: async () => ({ ...caseData }) } as unknown as GlanceApi)
+  const audioCalls: boolean[] = []
+  app.setAudioControl(async (open) => { audioCalls.push(open); return true })
+  try {
+    app.state.screen = 'case'
+    app.state.focusedAction = 1
+    const longPress = parseEvenHubEvent({ sysEvent: {
+      eventType: OsEventTypeList.LONG_PRESS_EVENT,
+      eventSource: EventSourceType.TOUCH_EVENT_FROM_RING,
+    } })
+    const release = parseEvenHubEvent({ sysEvent: {
+      eventType: OsEventTypeList.LONG_PRESS_RELEASE_EVENT,
+      eventSource: EventSourceType.TOUCH_EVENT_FROM_RING,
+    } })
+    assert.equal(longPress?.kind, 'long_press')
+    assert.equal(release?.kind, 'long_press_release')
+    if (longPress) await app.handleGlassesInput(longPress)
+    if (release) await app.handleGlassesInput(release)
+    assert.equal(app.state.screen, 'case')
+    assert.equal(app.state.voicePhase, 'idle')
+    assert.deepEqual(audioCalls, [])
+
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
+    assert.equal(app.state.screen, 'voice')
+    assert.deepEqual(audioCalls, [])
+    if (longPress) await app.handleGlassesInput(longPress)
+    if (release) await app.handleGlassesInput(release)
+    assert.equal(app.state.voicePhase, 'idle')
     assert.deepEqual(audioCalls, [])
   } finally {
     await app.dispose()
@@ -140,7 +202,7 @@ test('failed G2 microphone activation stays stopped and never renders an active 
   app.setAudioControl(async (open) => { audioCalls.push(open); return false })
   try {
     app.state.screen = 'case'
-    app.state.focusedAction = 2
+    app.state.focusedAction = 1
     await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
     await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
 
@@ -148,15 +210,16 @@ test('failed G2 microphone activation stays stopped and never renders an active 
     assert.equal(app.state.voicePhase, 'error')
     assert.equal((app as unknown as { voiceCapture: { phase: string; byteLength: number } }).voiceCapture.phase, 'idle')
     assert.equal((app as unknown as { voiceCapture: { phase: string; byteLength: number } }).voiceCapture.byteLength, 0)
-    assert.match(app.getGlassText(), /CAPTURE STOPPED  \|  MIC OFF/)
-    assert.doesNotMatch(app.getGlassText(), /RECORDING  \|  MIC ACTIVE/)
+    assert.match(app.getGlassText(), /VOICE STOPPED/)
+    assert.match(app.getGlassText(), /MICROPHONE OFF/)
+    assert.doesNotMatch(app.getGlassText(), /G2 MIC ACTIVE/)
   } finally {
     await app.dispose()
     restore()
   }
 })
 
-test('resolve entry resets action 4; cancel returns without resolving and confirm resolves exactly once', async () => {
+test('resolve entry normalizes the case action; cancel returns without resolving and confirm resolves exactly once', async () => {
   const calls: Array<{ method: string; body?: unknown }> = []
   const api = {
     getCase: async () => { calls.push({ method: 'getCase' }); return { ...caseData } },
@@ -173,21 +236,22 @@ test('resolve entry resets action 4; cancel returns without resolving and confir
 
   try {
     app.state.screen = 'case'
-    app.state.focusedAction = 4
+    app.state.focusedAction = 3
     await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
     assert.equal(app.state.screen, 'resolve')
     assert.equal(app.state.focusedAction, 0)
-    assert.match(app.getGlassText(), /> CONFIRM RESOLVE  \|  CANCEL/)
+    assert.match(app.getGlassText(), /ACTION  1\/2  > CONFIRM RESOLVE/)
     assert.equal(calls.some((call) => call.method === 'resolveCase'), false)
 
     await app.handleGlassesInput({ kind: 'click', source: null, envelope: 'sysEvent' })
-    assert.match(app.getGlassText(), /CONFIRM RESOLVE  \|  > CANCEL/)
+    await settleSingleClick()
+    assert.match(app.getGlassText(), /ACTION  2\/2  > CANCEL/)
     await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
     assert.equal(app.state.screen, 'case')
     assert.equal(calls.some((call) => call.method === 'resolveCase'), false)
 
     app.state.screen = 'case'
-    app.state.focusedAction = 4
+    app.state.focusedAction = 3
     await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
     assert.equal(app.state.focusedAction, 0)
     await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
@@ -216,10 +280,10 @@ test('invalid resolve action is visibly rejected and cannot resolve a case', asy
     app.state.screen = 'resolve'
     app.state.focusedAction = 99
     ;(app as unknown as { render(): void }).render()
-    assert.match(app.getGlassText(), /ACTION SELECTION INVALID/)
-    assert.doesNotMatch(app.getGlassText(), /> CANCEL/)
+    assert.match(app.getGlassText(), /ACTION  2\/2  > CANCEL/)
     await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
-    assert.equal(app.state.focusedAction, 0)
+    assert.equal(app.state.focusedAction, 1)
+    assert.equal(app.state.screen, 'case')
     assert.equal(resolves, 0)
   } finally {
     await app.dispose()
@@ -248,6 +312,7 @@ test('single inbox click opens the selected case, root double-click exits to Eve
     assert.equal(omittedZero?.kind, 'click')
     if (!omittedZero) throw new Error('Expected a native list click.')
     await app.handleGlassesInput(omittedZero)
+    await settleSingleClick()
     assert.equal(app.state.caseData?.customer_label, 'Amina')
     assert.deepEqual(calls, [app.state.inbox!.items[0].case_id])
 
@@ -257,6 +322,7 @@ test('single inbox click opens the selected case, root double-click exits to Eve
     assert.equal(selectedKendi?.kind, 'click')
     if (!selectedKendi) throw new Error('Expected the selected native list item click.')
     await app.handleGlassesInput(selectedKendi)
+    await settleSingleClick()
     assert.equal(app.state.caseData?.customer_label, 'Kendi')
     assert.equal(calls.at(-1), app.state.inbox!.items[2].case_id)
 
@@ -265,12 +331,13 @@ test('single inbox click opens the selected case, root double-click exits to Eve
     if (echo) await app.handleGlassesInput(echo)
     assert.equal(calls.length, callsBeforeEcho)
 
-    app.state.focusedAction = 5
-    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
-    assert.equal(app.state.screen, 'inbox')
+    app.state.screen = 'inbox'
+    app.state.focusedAction = 0
+    app.state.selectedIndex = 0
     const rootCalls = calls.length
-    ;(app as unknown as { physicalPresses: { clear(): void } }).physicalPresses.clear()
-    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'listEvent' })
+    const rootTap = parseEvenHubEvent({ listEvent: { containerID: 2 } })
+    if (rootTap) await app.handleGlassesInput(rootTap)
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
     assert.equal(app.state.screen, 'inbox')
     assert.equal(calls.length, rootCalls)
     assert.deepEqual(exitModes, [1])
@@ -371,13 +438,17 @@ test('G2 capture is owner-started and microphone closes on backgrounding; sessio
 
     app.state.voicePhase = 'transcript_ready'
     app.state.voiceTranscript = 'temporary transcript'
-    app.sessions.clear()
+    const pendingKey = (app as unknown as { keys: { acquire(scope: string, payload: unknown, create?: () => string): string; get(scope: string): { key: string } | null } }).keys
+      .acquire('approve:case-voice', { expected_version: 5, draft_id: 'ai-draft', text: 'Exact pending reply' }, () => 'pending-key')
     const lost = (app as unknown as { handleLostSession(error: unknown): boolean }).handleLostSession(
       new ApiError('session_revoked', 401, 'safe'),
     )
     assert.equal(lost, true)
     assert.equal(app.state.screen, 'pair')
     assert.equal(app.state.voiceTranscript, '')
+    assert.equal(app.state.caseData, null)
+    assert.equal(app.sessions.load(), null)
+    assert.equal((app as unknown as { keys: { get(scope: string): { key: string } | null } }).keys.get('approve:case-voice')?.key, pendingKey)
   } finally {
     await app.dispose()
     restore()
@@ -459,7 +530,7 @@ test('disposing the app requests microphone shutdown before the page exit handle
   }
 })
 
-test('G2 fixture screens stay glanceable and exact approval remains on the phone', async () => {
+test('G2 fixture screens are glanceable and support glasses-only reply review', async () => {
   const api = { getCase: async () => ({ ...caseData }) } as unknown as GlanceApi
   const { app, restore } = makeApp(api)
   const render = () => (app as unknown as { render(): void }).render()
@@ -474,25 +545,26 @@ test('G2 fixture screens stay glanceable and exact approval remains on the phone
     app.state.screen = 'pair'
     render()
     assert.match(screenText(), /PAIRING/)
-    assert.match(screenText(), /PAIR AND REVIEW ON PHONE/)
+    assert.match(screenText(), /PAIR THIS DEVICE WITH TELEGRAM/)
 
     app.state.screen = 'inbox'
     app.state.inbox = await app.fixtures.getInbox()
     render()
     assert.match(screenText(), /GLANCE DEMO/)
-    assert.match(screenText(), /Amina \| OWNER REQUEST/)
-    assert.match(screenText(), /Nia \| DEPOSIT QUESTION/)
-    assert.match(screenText(), /TAP: OPEN  \|  SWIPE: SELECT/)
+    assert.match(screenText(), /Amina \| TELEGRAM \| OWNER REQUEST/)
+    assert.match(screenText(), /Nia \| TELEGRAM \| DEPOSIT QUESTION/)
+    assert.match(screenText(), /TAP TO OPEN/)
 
     await app.handleGlassesInput({ kind: 'click', source: null, envelope: 'listEvent', selectedIndex: 0 })
+    await settleSingleClick()
     assert.equal(app.state.screen, 'case')
-    assert.match(screenText(), /CASE DETAIL/)
-    assert.match(screenText(), /MSG 1\/5/)
+    assert.match(screenText(), /GLANCE DEMO  \|  CASE/)
+    assert.match(screenText(), /MSG 1\/10/)
     assert.match(screenText(), /The owner is checking the request/i)
     const firstContextPage = screenText()
     await app.handleGlassesInput({ kind: 'scroll_up', source: null })
-    assert.match(screenText(), /MSG 2\/5/)
-    assert.match(screenText(), /Please let me know when you can/i)
+    assert.match(screenText(), /MSG 2\/10/)
+    assert.match(screenText(), /I am nearby now/i)
     assert.notEqual(screenText(), firstContextPage)
     await app.handleGlassesInput({ kind: 'scroll_down', source: null })
     assert.equal(screenText(), firstContextPage)
@@ -501,15 +573,15 @@ test('G2 fixture screens stay glanceable and exact approval remains on the phone
     render()
     await access.activateGlassAction()
     assert.equal(app.state.screen, 'draft')
-    assert.match(screenText(), /SYNTHETIC DRAFT  \|  NOT SENT/)
-    assert.match(screenText(), /FULL TEXT AND APPROVAL ON PHONE/)
+    assert.match(screenText(), /AI SUGGESTION/)
+    assert.match(screenText(), /NOT SENT/)
 
     app.state.screen = 'approval'
-    app.state.approvalText = 'Sensitive exact outgoing reply must stay on the phone.'
+    app.state.approvalText = 'Sensitive exact outgoing reply must be reviewed on G2.'
     app.state.reply = null
     render()
-    assert.match(screenText(), /OPEN THE PHONE TO REVIEW/)
-    assert.doesNotMatch(screenText(), /Sensitive exact outgoing reply/)
+    assert.match(screenText(), /Sensitive exact outgoing reply/)
+    assert.match(screenText(), /EXACT FINAL TEXT/)
     await access.activateGlassAction()
     assert.equal(app.state.screen, 'approval')
     assert.equal(app.state.reply, null)
@@ -521,24 +593,25 @@ test('G2 fixture screens stay glanceable and exact approval remains on the phone
       submitted_at: null, delivered_at: null, failed_at: null,
     }
     render()
-    assert.match(screenText(), /OUTBOX: QUEUED/)
-    assert.match(screenText(), /DELIVERY NOT CONFIRMED/)
+    assert.match(screenText(), /QUEUED/)
+    assert.match(screenText(), /NOT SENT YET/)
+    assert.doesNotMatch(screenText(), /DELIVERED/)
     assert.doesNotMatch(screenText(), /DELIVERED/)
 
     app.state.screen = 'resolve'
     app.state.caseData = { ...app.state.caseData!, latest_reply: { ...app.state.reply, state: 'queued' } }
     render()
-    assert.match(screenText(), /QUEUED REPLY CANCELS BEFORE RESOLVE/)
-    assert.match(screenText(), /OWNER ACTION REQUIRED/)
+    assert.match(screenText(), /QUEUED REPLY WILL BE CANCELLED/)
+    assert.match(screenText(), /IT WILL NOT BE SENT/)
 
     app.state.screen = 'case'
-    app.state.focusedAction = 5
+    app.state.focusedAction = 4
     await access.activateGlassAction()
     assert.equal(app.state.screen, 'inbox')
 
     app.state.caseData = await app.fixtures.getCase(FIXTURE_CASE_ID)
     app.state.screen = 'case'
-    app.state.focusedAction = 2
+    app.state.focusedAction = 1
     const audioControlCalls: boolean[] = []
     app.setAudioControl(async (open) => { audioControlCalls.push(open); return true })
     await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
@@ -547,35 +620,36 @@ test('G2 fixture screens stay glanceable and exact approval remains on the phone
     await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
     assert.equal(app.state.screen, 'voice')
     assert.match(screenText(), /SIMULATION  \|  MIC OFF/)
-    assert.match(screenText(), /00:00  \/  00:40/)
-    assert.match(screenText(), /NO AUDIO CAPTURED/)
+    assert.match(screenText(), /00:00 \/ 00:40/)
+    assert.match(screenText(), /NO AUDIO BUFFERED/)
     assert.doesNotMatch(screenText(), /AUDIO BUFFERED IN MEMORY/)
     assert.equal((app as unknown as { voiceCapture: { byteLength: number } }).voiceCapture.byteLength, 0)
     assert.deepEqual(audioControlCalls, [])
 
     await access.activateGlassAction()
     assert.equal(app.state.voicePhase, 'transcript_ready')
-    assert.match(screenText(), /SIMULATION  \|  NO ASR/)
-    assert.match(screenText(), /PHONE: CHOOSE REPLY OR INSTRUCTION/)
+    assert.match(screenText(), /SIMULATED TRANSCRIPT/)
+    assert.match(screenText(), /USE AS REPLY/)
+    assert.match(screenText(), /AI DRAFT NEEDED/)
     assert.equal(audioControlCalls.length, 0)
 
     app.state.screen = 'inbox'
     app.state.inbox = { items: [], open_count: 0, has_more: false, next_cursor: null }
     app.state.connection = 'loading'
     render()
-    assert.match(screenText(), /CHECKING OPEN CASES/)
+    assert.match(screenText(), /CHECKING OPEN ESCALATIONS/)
     app.state.connection = 'connected'
     render()
-    assert.match(screenText(), /NO OPEN CASES/)
+    assert.match(screenText(), /NO OPEN ESCALATIONS/)
     app.state.connection = 'offline'
     render()
-    assert.match(screenText(), /INBOX UNAVAILABLE/)
+    assert.match(screenText(), /INBOX CONNECTION UNAVAILABLE/)
 
     app.state.screen = 'voice'
     app.state.voicePhase = 'error'
     app.state.voiceError = 'Synthetic bounded error.'
     render()
-    assert.match(screenText(), /CAPTURE STOPPED/)
+    assert.match(screenText(), /VOICE STOPPED/)
     assert.match(screenText(), /Synthetic bounded error/)
   } finally {
     await app.dispose()
@@ -598,6 +672,7 @@ test('native inbox list selection survives omitted index zero and opens the sele
     })
     assert.equal(app.state.selectedIndex, 2)
     await app.handleGlassesInput({ kind: 'click', source: null, envelope: 'listEvent' })
+    await settleSingleClick()
     assert.equal(app.state.screen, 'case')
     assert.equal(app.state.caseData?.customer_label, 'Kendi')
 
@@ -606,6 +681,7 @@ test('native inbox list selection survives omitted index zero and opens the sele
     await app.handleGlassesInput({
       kind: 'click', source: null, envelope: 'listEvent', selectedIndex: 0,
     })
+    await settleSingleClick()
     assert.equal(app.state.screen, 'case')
     assert.equal(app.state.caseData?.customer_label, 'Amina')
   } finally {
@@ -658,7 +734,7 @@ test('lightweight status polling refreshes context only for case changes and ren
   }
 })
 
-test('G2 recording and transcript screens are bounded and keep full review on the phone', async () => {
+test('G2 recording and transcript screens show bounded state and explicit on-glasses intent choices', async () => {
   const api = {} as GlanceApi
   const { app, restore } = makeApp(api)
   try {
@@ -667,19 +743,19 @@ test('G2 recording and transcript screens are bounded and keep full review on th
     app.state.voiceDurationMs = 8_000
     ;(app as unknown as { render(): void }).render()
     const recording = app.getGlassText()
-    assert.match(recording, /RECORDING  \|  MIC ACTIVE/)
-    assert.match(recording, /00:08  \/  00:40/)
+    assert.match(recording, /RECORDING  \|  G2 MIC ACTIVE/)
+    assert.match(recording, /00:08 \/ 00:40/)
     assert.match(recording, /STOP AND REVIEW/)
-    assert.match(recording, /\|  CANCEL/)
+    assert.match(recording, /> STOP AND REVIEW  \|  CANCEL/)
 
     app.state.voicePhase = 'transcript_ready'
-    app.state.voiceTranscript = 'The complete recognized sentence is visible on the phone for owner review.'
+    app.state.voiceTranscript = 'The complete recognized sentence can be reviewed on G2.'
     ;(app as unknown as { render(): void }).render()
     const transcript = app.getGlassText()
-    assert.match(transcript, /TRANSCRIPT  \|  NOT SENT/)
-    assert.match(transcript, /PHONE: CHOOSE REPLY OR INSTRUCTION/)
-    assert.doesNotMatch(transcript, /The complete recognized sentence is visible on the phone for owner review\./)
-    assert.match(transcript, /TRANSCRIPT READY/)
+    assert.match(transcript, /NOT SENT/)
+    assert.match(transcript, /The complete recognized sentence can be\s+reviewed on G2/)
+    assert.match(transcript, /USE AS REPLY/)
+    assert.match(transcript, /AI DRAFT NEEDED BEFORE REVISION/)
   } finally {
     await app.dispose()
     restore()

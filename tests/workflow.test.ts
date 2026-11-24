@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { AudioInputSource } from '@evenrealities/even_hub_sdk'
+import { AudioInputSource, EventSourceType, OsEventTypeList } from '@evenrealities/even_hub_sdk'
 import { DemoFixtures, FIXTURE_CASE_ID, FIXTURE_UNKNOWN_CASE_ID } from '../src/demo-fixtures.ts'
 import { parseEvenHubEvent, PhysicalPressDeduplicator } from '../src/evenhub-events.ts'
 import {
@@ -120,6 +120,26 @@ test('Even Hub envelope parser distinguishes click, scroll, double-click, and li
     assert.equal(audio.source, AudioInputSource.Glasses)
     assert.equal(audio.pcm, pcm)
   }
+})
+
+test('input parser keeps contextual-menu and long-press envelopes distinct from clicks', () => {
+  const menu = parseEvenHubEvent({ menuItemClickEvent: { itemID: 65 } })
+  const longPress = parseEvenHubEvent({ sysEvent: {
+    eventType: OsEventTypeList.LONG_PRESS_EVENT,
+    eventSource: EventSourceType.TOUCH_EVENT_FROM_RING,
+  } })
+  const release = parseEvenHubEvent({ sysEvent: {
+    eventType: OsEventTypeList.LONG_PRESS_RELEASE_EVENT,
+    eventSource: EventSourceType.TOUCH_EVENT_FROM_RING,
+  } })
+  const empty = parseEvenHubEvent({})
+  const emptyAudio = parseEvenHubEvent({ audioEvent: { source: AudioInputSource.Glasses } })
+
+  assert.deepEqual(menu, { kind: 'menu', itemId: 65, source: null })
+  assert.equal(longPress?.kind, 'long_press')
+  assert.equal(release?.kind, 'long_press_release')
+  assert.equal(empty, null)
+  assert.equal(emptyAudio?.kind, 'audio')
 })
 
 test('physical press deduplication drops cross-envelope echoes but preserves same-envelope presses', () => {

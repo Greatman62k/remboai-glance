@@ -11,17 +11,24 @@ export interface AppStateView {
   salonName: string
   inbox: InboxData | null
   inboxStale: boolean
+  newCaseAvailable: boolean
   selectedIndex: number
   caseData: CaseData | null
   stale: boolean
   messagePage: number
+  draftPage: number
+  transcriptPage: number
   draft: DraftData | null
   editorText: string
   revisionInstruction: string
   approvalText: string
   reviewedExactText: boolean
+  approvalPage: number
+  approvalProgress: number
+  approvalStage: 'review' | 'confirm'
   reply: ReplyData | null
   busy: boolean
+  busyAction: string
   error: string
   requestId: string | null
   retryAfter: number | null

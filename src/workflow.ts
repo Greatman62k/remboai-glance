@@ -2,11 +2,13 @@ import type { CaseData, InboxItem, ReplyState } from './types.ts'
 import type { StorageLike } from './session.ts'
 
 export const PENDING_IDEMPOTENCY_STORAGE_KEY = 'remboai-glance.pending-actions.v1'
-export const CONTEXT_PAGE_SIZE = 2
+// One customer-visible event per G2 page leaves room for wrapped text and the
+// case/version labels without clipping the oldest-history indicator.
+export const CONTEXT_PAGE_SIZE = 1
 
-function browserSessionStorage(): StorageLike | null {
+function browserLocalStorage(): StorageLike | null {
   try {
-    return typeof sessionStorage === 'undefined' ? null : sessionStorage
+    return typeof localStorage === 'undefined' ? null : localStorage
   } catch {
     return null
   }
@@ -51,9 +53,11 @@ export function createUuidV4(cryptoSource: Crypto = globalThis.crypto): string {
 export class IdempotencyKeyBook {
   private readonly pending = new Map<string, { key: string; payload: string }>()
   private readonly storage: StorageLike | null
+  private readonly storageKey: string
 
-  constructor(storage: StorageLike | null = browserSessionStorage()) {
+  constructor(storage: StorageLike | null = browserLocalStorage(), storageKey = PENDING_IDEMPOTENCY_STORAGE_KEY) {
     this.storage = storage
+    this.storageKey = storageKey
     this.restore()
   }
 
@@ -80,7 +84,7 @@ export class IdempotencyKeyBook {
   clear(): void {
     this.pending.clear()
     try {
-      this.storage?.removeItem(PENDING_IDEMPOTENCY_STORAGE_KEY)
+      this.storage?.removeItem(this.storageKey)
     } catch {
       // The in-memory keys are still cleared if browser storage is unavailable.
     }
@@ -90,10 +94,24 @@ export class IdempotencyKeyBook {
     return this.pending.has(scope)
   }
 
+  get(scope: string): { key: string; payload: unknown } | null {
+    const value = this.pending.get(scope)
+    if (!value) return null
+    try { return { key: value.key, payload: JSON.parse(value.payload) as unknown } }
+    catch { return null }
+  }
+
+  entries(): Array<{ scope: string; key: string; payload: unknown }> {
+    return [...this.pending].flatMap(([scope, value]) => {
+      try { return [{ scope, key: value.key, payload: JSON.parse(value.payload) as unknown }] }
+      catch { return [] }
+    })
+  }
+
   private restore(): void {
     if (!this.storage) return
     try {
-      const raw = this.storage.getItem(PENDING_IDEMPOTENCY_STORAGE_KEY)
+      const raw = this.storage.getItem(this.storageKey)
       if (!raw) return
       const entries = JSON.parse(raw) as unknown
       if (!Array.isArray(entries)) throw new Error('Invalid pending action store')
@@ -107,7 +125,7 @@ export class IdempotencyKeyBook {
         }
       }
     } catch {
-      try { this.storage.removeItem(PENDING_IDEMPOTENCY_STORAGE_KEY) } catch { /* ignore unavailable storage */ }
+      try { this.storage.removeItem(this.storageKey) } catch { /* ignore unavailable storage */ }
     }
   }
 
@@ -115,8 +133,8 @@ export class IdempotencyKeyBook {
     if (!this.storage) return
     try {
       const entries = [...this.pending].map(([scope, value]) => ({ scope, ...value }))
-      if (entries.length) this.storage.setItem(PENDING_IDEMPOTENCY_STORAGE_KEY, JSON.stringify(entries))
-      else this.storage.removeItem(PENDING_IDEMPOTENCY_STORAGE_KEY)
+      if (entries.length) this.storage.setItem(this.storageKey, JSON.stringify(entries))
+      else this.storage.removeItem(this.storageKey)
     } catch {
       // Requests can still retry in this app instance when tab storage is unavailable.
     }

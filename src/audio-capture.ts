@@ -1,4 +1,5 @@
 import { AudioInputSource } from '@evenrealities/even_hub_sdk'
+import { runtimeMetrics } from './runtime-metrics.ts'
 
 export const PCM_SAMPLE_RATE = 16_000
 export const PCM_BYTES_PER_SECOND = PCM_SAMPLE_RATE * 2
@@ -78,6 +79,7 @@ export class G2PcmCapture {
     if (this.state !== 'idle' || this.cancelling) return false
     const generation = ++this.generation
     this.buffer = new Uint8Array(MAX_CAPTURE_BYTES)
+    runtimeMetrics.audioBuffer(MAX_CAPTURE_BYTES)
     this.length = 0
     this.control = control
     this.onStopRequested = onStopRequested

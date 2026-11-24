@@ -199,7 +199,7 @@ export class DemoFixtures {
       const draft: DraftData = {
         draft_id: crypto.randomUUID(),
         based_on_version: current.version,
-        text: 'Thanks for checking. I’m confirming today’s availability and will get back to you shortly.',
+        text: "Thanks for checking. I'm confirming today's availability and will get back to you shortly.",
         source: 'ai',
         expires_at: new Date(Date.now() + 30 * 60_000).toISOString(),
       }
@@ -232,8 +232,8 @@ export class DemoFixtures {
       const current = await this.requireCurrentCase(caseId, expectedVersion)
       const hasRequestedTime = /\b(5|five|17:00)\b/i.test(instruction)
       const text = hasRequestedTime
-        ? 'I’m checking the current walk-in availability before confirming a time. I’ll update you shortly.'
-        : 'Thanks for your message. I’m checking the details and will update you shortly.'
+        ? "I'm checking the current walk-in availability before confirming a time. I'll update you shortly."
+        : "Thanks for your message. I'm checking the details and will update you shortly."
       const draft: DraftData = {
         draft_id: crypto.randomUUID(),
         based_on_version: current.version,

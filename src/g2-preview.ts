@@ -1,25 +1,35 @@
 import { FIXTURE_CASE_ID } from './demo-fixtures.ts'
 import type { GlanceAppController } from './app.ts'
 import type { ReplyData } from './types.ts'
+import { CONTEXT_PAGE_SIZE } from './workflow.ts'
+import { paginateGlassesApprovalText } from './glasses-ui.ts'
 
 export type G2PreviewName =
   | 'inbox'
   | 'case'
+  | 'case-older'
   | 'draft'
   | 'voice-ready'
   | 'voice-recording'
   | 'transcript-preview'
+  | 'approval-review'
+  | 'approval-confirm'
   | 'reply-status'
+  | 'resolve'
   | 'case-resolved'
 
 const ROUTES: G2PreviewName[] = [
   'inbox',
   'case',
+  'case-older',
   'draft',
   'voice-ready',
   'voice-recording',
   'transcript-preview',
+  'approval-review',
+  'approval-confirm',
   'reply-status',
+  'resolve',
   'case-resolved',
 ]
 
@@ -60,6 +70,10 @@ export async function prepareG2Preview(app: GlanceAppController, route: G2Previe
     case 'case':
       app.state.screen = 'case'
       break
+    case 'case-older':
+      app.state.screen = 'case'
+      app.state.messagePage = Math.max(0, Math.ceil(app.state.caseData.context.length / CONTEXT_PAGE_SIZE) - 1)
+      break
     case 'draft':
       app.state.draft = await app.fixtures.createDraft(
         FIXTURE_CASE_ID,
@@ -68,6 +82,23 @@ export async function prepareG2Preview(app: GlanceAppController, route: G2Previe
       )
       app.state.screen = 'draft'
       break
+    case 'approval-review':
+    case 'approval-confirm': {
+      app.state.draft = await app.fixtures.createDraft(
+        FIXTURE_CASE_ID,
+        app.state.caseData.version,
+        'g2-approval-preview',
+      )
+      app.state.editorText = "Thanks for asking. I will check today's availability with the team and confirm what we can offer. I do not want to promise a time until they verify the current schedule. I will send you an update as soon as I have a reliable answer."
+      app.state.approvalText = app.state.editorText
+      app.state.screen = 'approval'
+      app.state.approvalStage = route === 'approval-confirm' ? 'confirm' : 'review'
+      app.state.approvalProgress = route === 'approval-confirm'
+        ? paginateGlassesApprovalText(app.state.approvalText).length - 1
+        : 0
+      app.state.approvalPage = 0
+      break
+    }
     case 'voice-ready':
       app.state.screen = 'voice'
       break
@@ -102,6 +133,11 @@ export async function prepareG2Preview(app: GlanceAppController, route: G2Previe
       app.state.screen = 'status'
       break
     }
+    case 'resolve':
+      app.state.screen = 'resolve'
+      app.state.focusedAction = 0
+      app.state.acknowledgedUnknown = false
+      break
     case 'case-resolved':
       await app.fixtures.resolveCase(FIXTURE_CASE_ID, {
         expected_version: app.state.caseData.version,

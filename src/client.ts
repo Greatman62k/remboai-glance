@@ -13,6 +13,7 @@ import type {
   SessionData,
   TranscriptionData,
 } from './types.ts'
+import { runtimeMetrics } from './runtime-metrics.ts'
 
 export type FetchLike = typeof fetch
 
@@ -25,19 +26,20 @@ export interface RequestOptions {
   timeoutMs?: number
   timeoutCode?: string
   authenticated?: boolean
+  polling?: boolean
 }
 
 export interface GlanceApi {
   exchangePairing(code: string, deviceLabel: string, signal?: AbortSignal): Promise<SessionData>
   revokeCurrentSession(signal?: AbortSignal): Promise<void>
-  getInbox(signal?: AbortSignal): Promise<InboxData>
+  getInbox(signal?: AbortSignal, polling?: boolean): Promise<InboxData>
   getCase(caseId: string, signal?: AbortSignal): Promise<CaseData>
-  getCaseStatus(caseId: string, signal?: AbortSignal): Promise<CaseStatusData>
+  getCaseStatus(caseId: string, signal?: AbortSignal, polling?: boolean): Promise<CaseStatusData>
   createDraft(caseId: string, expectedVersion: number, key: string, signal?: AbortSignal): Promise<DraftData>
   createManualDraft(caseId: string, expectedVersion: number, text: string, key: string, signal?: AbortSignal): Promise<DraftData>
   reviseDraft(caseId: string, draftId: string, expectedVersion: number, instruction: string, key: string, signal?: AbortSignal): Promise<DraftData>
   approveReply(caseId: string, expectedVersion: number, draftId: string, text: string, key: string, signal?: AbortSignal): Promise<ReplyResult>
-  getReply(replyId: string, signal?: AbortSignal): Promise<ReplyData>
+  getReply(replyId: string, signal?: AbortSignal, polling?: boolean): Promise<ReplyData>
   resolveCase(caseId: string, body: ResolveRequest, signal?: AbortSignal): Promise<ResolveResult>
   transcribeAudio(pcm: Uint8Array, signal?: AbortSignal): Promise<TranscriptionData>
 }
@@ -160,8 +162,8 @@ export class GlanceApiClient {
     this.sessions.clear()
   }
 
-  getInbox(signal?: AbortSignal): Promise<InboxData> {
-    return this.request<InboxData>('GET', '/inbox?limit=20', { signal })
+  getInbox(signal?: AbortSignal, polling = false): Promise<InboxData> {
+    return this.request<InboxData>('GET', '/inbox?limit=20', { signal, polling })
   }
 
   getCase(caseId: string, signal?: AbortSignal): Promise<CaseData> {
@@ -172,11 +174,11 @@ export class GlanceApiClient {
     )
   }
 
-  getCaseStatus(caseId: string, signal?: AbortSignal): Promise<CaseStatusData> {
+  getCaseStatus(caseId: string, signal?: AbortSignal, polling = true): Promise<CaseStatusData> {
     return this.request<CaseStatusData>(
       'GET',
       `/cases/${encodeURIComponent(caseId)}/status`,
-      { signal },
+      { signal, polling },
     )
   }
 
@@ -218,8 +220,8 @@ export class GlanceApiClient {
     })
   }
 
-  getReply(replyId: string, signal?: AbortSignal): Promise<ReplyData> {
-    return this.request<ReplyData>('GET', `/replies/${encodeURIComponent(replyId)}`, { signal })
+  getReply(replyId: string, signal?: AbortSignal, polling = false): Promise<ReplyData> {
+    return this.request<ReplyData>('GET', `/replies/${encodeURIComponent(replyId)}`, { signal, polling })
   }
 
   resolveCase(caseId: string, body: ResolveRequest, signal?: AbortSignal): Promise<ResolveResult> {
@@ -259,6 +261,16 @@ export class GlanceApiClient {
   }
 
   private async request<T>(method: string, path: string, options: RequestOptions = {}): Promise<T> {
+    const startedAt = typeof performance !== 'undefined' ? performance.now() : Date.now()
+    try {
+      return await this.performRequest<T>(method, path, options)
+    } finally {
+      const endedAt = typeof performance !== 'undefined' ? performance.now() : Date.now()
+      runtimeMetrics.apiRequest(endedAt - startedAt, Boolean(options.polling))
+    }
+  }
+
+  private async performRequest<T>(method: string, path: string, options: RequestOptions = {}): Promise<T> {
     const authenticated = options.authenticated !== false
     const session = authenticated ? this.sessions.load() : null
     if (authenticated && !session) {

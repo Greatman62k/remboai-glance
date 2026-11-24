@@ -19,6 +19,7 @@ export type GlanceInput =
   }
   | { kind: 'foreground_enter' | 'foreground_exit' | 'system_exit' | 'abnormal_exit'; source: null }
   | { kind: 'menu'; itemId: number | null; source: null }
+  | { kind: 'long_press' | 'long_press_release'; source: EventSourceType | null; envelope: 'sysEvent' }
   | { kind: 'audio'; source: AudioInputSource | null; pcm: Uint8Array | null }
 
 type EventCandidate = NonNullable<EvenHubEvent['sysEvent'] | EvenHubEvent['textEvent'] | EvenHubEvent['listEvent']>
@@ -79,6 +80,8 @@ export function parseEvenHubEvent(input: unknown): GlanceInput | null {
     if (eventType === OsEventTypeList.FOREGROUND_EXIT_EVENT) return { kind: 'foreground_exit', source: null }
     if (eventType === OsEventTypeList.SYSTEM_EXIT_EVENT) return { kind: 'system_exit', source: null }
     if (eventType === OsEventTypeList.ABNORMAL_EXIT_EVENT) return { kind: 'abnormal_exit', source: null }
+    if (eventType === OsEventTypeList.LONG_PRESS_EVENT) return { kind: 'long_press', source, envelope: 'sysEvent' }
+    if (eventType === OsEventTypeList.LONG_PRESS_RELEASE_EVENT) return { kind: 'long_press_release', source, envelope: 'sysEvent' }
 
     let kind: PressKind | null = null
     if (eventType === OsEventTypeList.DOUBLE_CLICK_EVENT) kind = 'double_click'

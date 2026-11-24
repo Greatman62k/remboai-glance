@@ -6,6 +6,7 @@ import {
   glassesPageText,
   glassesPageToPayload,
   glassesPagesHaveSameLayout,
+  paginateGlassesApprovalText,
   type GlassesState,
 } from '../src/glasses-ui.ts'
 import { DemoFixtures, FIXTURE_CASE_ID } from '../src/demo-fixtures.ts'
@@ -20,17 +21,24 @@ function makeState(overrides: Partial<GlassesState> = {}): GlassesState {
     salonName: 'Synthetic cases',
     inbox: null,
     inboxStale: false,
+    newCaseAvailable: false,
     selectedIndex: 0,
     caseData: null,
     stale: false,
     messagePage: 0,
+    draftPage: 0,
+    transcriptPage: 0,
     draft: null,
     editorText: '',
     revisionInstruction: '',
     approvalText: '',
     reviewedExactText: false,
+    approvalPage: 0,
+    approvalProgress: 0,
+    approvalStage: 'review',
     reply: null,
     busy: false,
+    busyAction: '',
     error: '',
     requestId: null,
     retryAfter: null,
@@ -138,16 +146,18 @@ test('all eight G2 screens use bounded SDK-native layouts with one capture targe
   for (const page of pages) assertNativePage(page)
 })
 
-test('approval text stays phone-only and queued or submitted replies never read as delivered', async () => {
+test('G2 approval displays the exact outgoing text while Telegram status never claims delivery', async () => {
   const fixtures = new DemoFixtures()
   fixtures.startDemo()
   const caseData = await fixtures.getCase(FIXTURE_CASE_ID)
-  const hiddenExactText = 'Private exact outgoing message that must stay on phone.'
+  const exactText = 'Private exact outgoing message must be reviewed before sending.'
   const approval = buildGlassesPage(makeState({
-    screen: 'approval', caseData, approvalText: hiddenExactText,
+    screen: 'approval', caseData, approvalText: exactText,
   }))
-  assert.doesNotMatch(glassesPageText(approval), /Private exact outgoing message/)
-  assert.match(glassesPageText(approval), /OPEN THE PHONE TO REVIEW/)
+  assert.match(glassesPageText(approval), /Private exact outgoing message must be reviewed\s+before sending/)
+  assert.match(glassesPageText(approval), /REPLY 1\/1  \|  EXACT FINAL TEXT/)
+  assert.match(glassesPageText(approval), /PROGRESS 0\/1 PAGES COMPLETE/)
+  assert.match(glassesPageText(approval), /SWIPE DOWN FOR FINAL CONFIRMATION/)
 
   const queuedCase = await fixtures.getCase((await fixtures.getInbox()).items[1].case_id)
   const reply = (state: ReplyData['state']): ReplyData => ({
@@ -165,9 +175,36 @@ test('approval text stays phone-only and queued or submitted replies never read 
   for (const state of ['queued', 'submitted'] as const) {
     const page = buildGlassesPage(makeState({ screen: 'status', caseData: queuedCase, reply: reply(state) }))
     const text = glassesPageText(page)
-    assert.match(text, /DELIVERY NOT CONFIRMED/)
+    if (state === 'submitted') assert.match(text, /DELIVERY NOT CONFIRMED/)
     assert.doesNotMatch(text, /DELIVERED/)
   }
+  const telegramDelivered = buildGlassesPage(makeState({ screen: 'status', caseData: queuedCase, reply: reply('delivered') }))
+  assert.match(glassesPageText(telegramDelivered), /DELIVERY UNVERIFIABLE/)
+  assert.doesNotMatch(glassesPageText(telegramDelivered), /DELIVERY RECEIPT CONFIRMED|DELIVERED/)
+})
+
+test('exact approval pages contain at most three wrapped text lines for the 576x288 layout', () => {
+  const exactText = Array.from({ length: 80 }, (_, index) => `word${index}`).join(' ')
+  const pages = paginateGlassesApprovalText(exactText)
+  assert.ok(pages.length > 1)
+  assert.ok(pages.every((page) => page.split('\n').length <= 3))
+  assert.equal(pages.join(' ').replace(/\s+/g, ' '), exactText)
+})
+
+test('display-safe draft copy is offered only within the manual-draft limit', async () => {
+  const longText = 'é'.repeat(701)
+  const state = makeState({
+    screen: 'draft',
+    draft: {
+      draft_id: 'long-unicode-draft', based_on_version: 3, text: longText, source: 'ai',
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+    },
+    editorText: longText,
+  })
+  const page = buildGlassesPage(state)
+  const content = glassesPageText(page)
+  assert.match(content, /DISPLAY COPY EXCEEDS 700 CHARS/)
+  assert.doesNotMatch(content, /CREATE ASCII COPY/)
 })
 
 test('open fixture cases remain open until the synthetic resolver confirms them', async () => {
@@ -199,15 +236,18 @@ test('case context pages render different bounded events and clamp missing or si
   const olderText = glassesPageText(older)
   const lastText = glassesPageText(last)
 
-  assert.match(firstText, /MSG 1\/5/)
+  assert.match(firstText, /MSG 1\/10/)
   assert.match(firstText, /The owner is checking the request/)
-  assert.match(firstText, /I am nearby now/)
-  assert.match(middleText, /MSG 2\/5/)
-  assert.match(middleText, /Please let me know when you can/)
+  assert.match(middleText, /MSG 2\/10/)
+  assert.match(middleText, /I am nearby now/)
   assert.notEqual(firstText, middleText)
-  assert.match(olderText, /MSG 3\/5/)
-  assert.match(olderText, /I can come before five if that works/)
-  assert.match(lastText, /MSG 5\/5  OLDER OMITTED/)
+  assert.match(olderText, /MSG 3\/10/)
+  assert.match(olderText, /I've shared the question with the owner/)
+  const earlier = glassesPageText(buildGlassesPage(makeState({ screen: 'case', caseData, messagePage: 5 })))
+  assert.match(earlier, /MSG 6\/10/)
+  assert.match(earlier, /I can come before five if that works/)
+  assert.match(lastText, /MSG 10\/10  \|  10 VISIBLE/)
+  assert.match(lastText, /EARLIER HISTORY OMITTED/)
   assert.match(lastText, /Hello, I wanted to ask about coming/)
 
   const singleEvent = {

@@ -13,7 +13,9 @@ import type {
   ResolveRequest,
 } from './types.ts'
 import type { AppStateView, GlanceScreen } from './state-view.ts'
-import { buildGlassesPage, glassesPageText, type GlassesPage } from './glasses-ui.ts'
+import { buildGlassesPage, canCreateDisplaySafeCopy, glassesPageText, G2_MENU, glassesReviewCopy, hasUncertainApproval, needsGlassesReviewCopy, paginateGlassesApprovalText, paginateGlassesText, type GlassesPage } from './glasses-ui.ts'
+import { runtimeMetrics } from './runtime-metrics.ts'
+import { WorkspaceStore, type WorkspaceView } from './workspace.ts'
 import {
   IdempotencyKeyBook,
   categoryLabel,
@@ -31,11 +33,15 @@ interface AppState extends AppStateView {
   code: string
   manualMode: boolean
   inboxStale: boolean
+  newCaseAvailable: boolean
   busyAction: string
   replyId: string | null
   autoPolls: number
   acknowledgedUnknown: boolean
   reviewedExactText: boolean
+  approvalPage: number
+  approvalProgress: number
+  approvalStage: 'review' | 'confirm'
   glassesAvailable: boolean
   glassesStatus: string
   voicePhase: 'idle' | 'starting' | 'recording' | 'stopping' | 'transcribing' | 'transcript_ready' | 'error'
@@ -61,6 +67,7 @@ const EMPTY_STATE: AppState = {
   salonName: '',
   inbox: null,
   inboxStale: false,
+  newCaseAvailable: false,
   selectedIndex: 0,
   caseData: null,
   stale: false,
@@ -70,6 +77,11 @@ const EMPTY_STATE: AppState = {
   revisionInstruction: '',
   approvalText: '',
   reviewedExactText: false,
+  approvalPage: 0,
+  approvalProgress: 0,
+  approvalStage: 'review',
+  draftPage: 0,
+  transcriptPage: 0,
   reply: null,
   busy: false,
   busyAction: '',
@@ -121,6 +133,8 @@ function caseStatusText(status: string): string {
   return status === 'resolved' ? 'Resolved' : 'Open'
 }
 
+const SINGLE_CLICK_SETTLE_MS = 280
+
 export class GlanceAppController {
   readonly state: AppState = structuredClone(EMPTY_STATE)
   readonly sessions: SessionStore
@@ -128,8 +142,10 @@ export class GlanceAppController {
   readonly fixtures = new DemoFixtures()
   private api: GlanceApi
   private readonly keys = new IdempotencyKeyBook()
-  // Voice payloads must never be written to sessionStorage with a retry key.
-  private readonly voiceKeys = new IdempotencyKeyBook(null)
+  // Explicitly selected voice actions use the same durable, payload-bound keys
+  // as other writes so an Android WebView restart cannot mint a second action.
+  private readonly voiceKeys = this.keys
+  private readonly workspace = new WorkspaceStore()
   private readonly voiceCapture = new G2PcmCapture()
   private readonly root: HTMLElement
   private glassesWriter: ((page: GlassesPage) => void) | null = null
@@ -140,6 +156,16 @@ export class GlanceAppController {
   private pollTimer: number | null = null
   private foreground = true
   private pollController: AbortController | null = null
+  private statusController: AbortController | null = null
+  private replyController: AbortController | null = null
+  private replyControllerId: string | null = null
+  private pendingReplyFetch: { replyId: string; schedule: boolean; polling: boolean } | null = null
+  private pendingSingleClickTimer: ReturnType<typeof setTimeout> | null = null
+  private pollInProgress = false
+  private foregroundRefreshInProgress = false
+  private statusRefreshInProgress = false
+  private approvalSnapshot = ''
+  private approvalDraftSnapshot = ''
   private transcriptionController: AbortController | null = null
   private uploadingPcm: Uint8Array | null = null
   private voiceGeneration = 0
@@ -169,7 +195,7 @@ export class GlanceAppController {
       this.render()
       return
     }
-    this.pollTimer = window.setInterval(() => void this.pollVisibleState(), 5_000)
+    this.pollTimer = window.setInterval(() => void this.pollVisibleState(), 30_000)
     const session = this.sessions.load()
     if (!session) {
       this.render()
@@ -181,6 +207,7 @@ export class GlanceAppController {
     this.state.screen = 'inbox'
     this.render()
     await this.loadInbox()
+    await this.restoreWorkspace()
   }
 
   setGlassesWriter(writer: (page: GlassesPage) => void): void {
@@ -217,10 +244,12 @@ export class GlanceAppController {
     if (this.pollTimer !== null) window.clearInterval(this.pollTimer)
     this.pollTimer = null
     this.pollController?.abort()
+    this.statusController?.abort()
+    this.replyController?.abort()
+    this.pendingReplyFetch = null
+    this.cancelPendingSingleClick()
     this.transcriptionController?.abort()
     await this.clearVoiceWorkflow('')
-    this.keys.clear()
-    this.voiceKeys.clear()
     this.voiceDerivedDraftIds.clear()
     this.physicalPresses.clear()
     this.glassesWriter = null
@@ -236,6 +265,8 @@ export class GlanceAppController {
   getGlassText(): string {
     return this.lastRenderedGlasses
   }
+
+  getRuntimeMetrics() { return runtimeMetrics.snapshot() }
 
   private enterVoiceReady(): void {
     const item = this.state.caseData
@@ -436,26 +467,33 @@ export class GlanceAppController {
       this.failLocal(error instanceof Error ? error.message : 'The transcript cannot be used as a reply.', 'invalid_text')
       return
     }
-    const fresh = await this.refreshCase()
-    if (!fresh || fresh.status !== 'open' || fresh.version !== current.version) {
+    const scope = `voice-manual:${current.case_id}`
+    const pending = this.voiceKeys.get(scope)
+    const pendingPayload = pending?.payload as { expected_version?: unknown; text?: unknown } | undefined
+    if (pending && (pendingPayload?.text !== transcript || typeof pendingPayload.expected_version !== 'number')) {
+      this.failLocal('A different dictated reply has an uncertain outcome. Retry that exact action first.', 'uncertain_action')
+      return
+    }
+    const fresh = pending ? current : await this.refreshCase()
+    if (!fresh || (!pending && (fresh.status !== 'open' || fresh.version !== current.version))) {
       this.state.stale = true
       this.state.message = 'The case changed. Refresh its context before using this transcript.'
       this.render()
       return
     }
-    const scope = `voice-manual:${fresh.case_id}`
+    const expectedVersion = pending ? pendingPayload!.expected_version as number : fresh.version
     let key: string
-    try { key = this.voiceKeys.acquire(scope, { expected_version: fresh.version, text: transcript }) } catch (error) {
+    try { key = this.voiceKeys.acquire(scope, { expected_version: expectedVersion, text: transcript }) } catch (error) {
       this.failLocal(error instanceof Error ? error.message : 'Retry the same voice action.', 'uncertain_action')
       return
     }
     await this.withBusy('voice-manual-draft', async () => {
-      const draft = await useTranscriptAsReply(this.api, fresh.case_id, fresh.version, transcript, key)
+      const draft = await useTranscriptAsReply(this.api, fresh.case_id, expectedVersion, transcript, key)
       this.voiceKeys.complete(scope)
       this.voiceDerivedDraftIds.add(draft.draft_id)
       await this.clearVoiceWorkflow('')
       this.acceptDraft(draft, true)
-      this.state.message = 'Owner-authored draft saved from your transcript. Review and approve the exact text on the phone.'
+      this.state.message = 'Owner-authored draft saved. Review every exact-text page on G2 before approval.'
     }, { keepKeyOnFailure: true, keyScope: scope, keyBook: this.voiceKeys })
   }
 
@@ -463,8 +501,9 @@ export class GlanceAppController {
   private showDemoTranscript(): void {
     if (!this.state.fixtureMode || !this.state.caseData || this.state.caseData.status !== 'open') return
     this.clearDemoCaptureTimer()
-    this.voiceKeys.clear()
     this.state.voicePhase = 'transcript_ready'
+    this.state.focusedAction = 0
+    this.state.transcriptPage = 0
     this.state.voiceDurationMs = 6_400
     this.state.voiceTranscriptionDurationMs = 240
     this.state.voiceTranscript = 'Please make it shorter and mention walk-ins may be available until 5 p.m.'
@@ -503,6 +542,8 @@ export class GlanceAppController {
     this.state.voiceDurationMs = Math.max(1_000, Math.min(40_000, Date.now() - this.demoCaptureStartedAt))
     this.clearDemoCaptureTimer()
     this.state.voicePhase = 'transcript_ready'
+    this.state.focusedAction = 0
+    this.state.transcriptPage = 0
     this.state.voiceTranscriptionDurationMs = null
     this.state.voiceTranscript = 'Please make it shorter and mention walk-ins may be available until 5 p.m.'
     this.state.voiceSimulation = true
@@ -521,31 +562,41 @@ export class GlanceAppController {
     const current = this.state.caseData
     const draft = this.state.draft
     const transcript = this.state.voiceTranscript
-    if (!canUseTranscriptAsInstruction(current, draft, this.state.stale, this.state.editorText, transcript)) {
+    if (!current || this.state.busy || !transcript) return
+    if (!draft) {
+      this.state.message = 'Create an AI suggestion for this case before using an instruction.'
+      this.render()
+      return
+    }
+    const scope = `voice-revise:${current.case_id}:${draft.draft_id}`
+    const pending = this.voiceKeys.get(scope)
+    const pendingPayload = pending?.payload as { expected_version?: unknown; instruction?: unknown } | undefined
+    const replay = Boolean(pending && pendingPayload?.instruction === transcript &&
+      typeof pendingPayload.expected_version === 'number')
+    if (!replay && !canUseTranscriptAsInstruction(current, draft, this.state.stale, this.state.editorText, transcript)) {
       this.failLocal('Use as instruction requires an unexpired, current AI draft with no unsaved edits and a transcript of 300 characters or fewer.', 'draft_unavailable')
       return
     }
-    if (!current || !draft || this.state.busy) return
-    const fresh = await this.refreshCase()
-    if (!fresh || !canUseTranscriptAsInstruction(fresh, draft, this.state.stale, this.state.editorText, transcript)) {
+    const fresh = replay ? current : await this.refreshCase()
+    if (!fresh || (!replay && !canUseTranscriptAsInstruction(fresh, draft, this.state.stale, this.state.editorText, transcript))) {
       this.state.stale = true
       this.state.message = 'Refresh the case or create a current AI suggestion before using a voice instruction.'
       this.render()
       return
     }
-    const scope = `voice-revise:${fresh.case_id}:${draft.draft_id}`
+    const expectedVersion = replay ? pendingPayload!.expected_version as number : fresh.version
     let key: string
-    try { key = this.voiceKeys.acquire(scope, { expected_version: fresh.version, instruction: transcript }) } catch (error) {
+    try { key = this.voiceKeys.acquire(scope, { expected_version: expectedVersion, instruction: transcript }) } catch (error) {
       this.failLocal(error instanceof Error ? error.message : 'Retry the same voice action.', 'uncertain_action')
       return
     }
     await this.withBusy('voice-revise', async () => {
-      const next = await useTranscriptAsInstruction(this.api, fresh.case_id, draft.draft_id, fresh.version, transcript, key)
+      const next = await useTranscriptAsInstruction(this.api, fresh.case_id, draft.draft_id, expectedVersion, transcript, key)
       this.voiceKeys.complete(scope)
       this.voiceDerivedDraftIds.add(next.draft_id)
       await this.clearVoiceWorkflow('')
       this.acceptDraft(next, false)
-      this.state.message = 'Revised AI draft saved. Review and edit the exact customer text on the phone.'
+      this.state.message = 'Revised AI draft saved. Review every exact-text page on G2 before approval.'
     }, { keepKeyOnFailure: true, keyScope: scope, keyBook: this.voiceKeys })
   }
 
@@ -582,7 +633,6 @@ export class GlanceAppController {
     this.uploadingPcm?.fill(0)
     this.uploadingPcm = null
     this.voiceFinish = null
-    this.voiceKeys.clear()
     this.state.voicePhase = 'idle'
     this.state.voiceDurationMs = 0
     this.state.voiceTranscriptionDurationMs = null
@@ -607,9 +657,14 @@ export class GlanceAppController {
 
   async handleGlassesInput(input: GlanceInput): Promise<void> {
     if (input.kind === 'foreground_exit') {
-      this.foreground = false
-      this.clearReplyTimer()
-      await this.stopForBackground()
+      // The SDK uses this event to close its contextual menu as well as to
+      // report app exits. Browser visibility is the reliable background signal.
+      if (document.visibilityState === 'hidden') {
+        this.foreground = false
+        this.cancelPendingSingleClick()
+        this.clearReplyTimer()
+        await this.stopForBackground()
+      }
       return
     }
     if (input.kind === 'foreground_enter') {
@@ -627,15 +682,26 @@ export class GlanceAppController {
       return
     }
     if (input.kind === 'system_exit' || input.kind === 'abnormal_exit') {
+      this.cancelPendingSingleClick()
       await this.clearVoiceWorkflow('')
       return
     }
     if (input.kind === 'menu') {
-      await this.stopForBackground()
+      this.cancelPendingSingleClick()
+      if (input.itemId !== null) await this.activateGlassMenuItem(input.itemId)
       return
     }
-    if (input.source !== null && input.source !== RING_EVENT_SOURCE && input.source !== EventSourceType.TOUCH_EVENT_FROM_GLASSES_R) return
+    if (input.kind === 'long_press' || input.kind === 'long_press_release') {
+      // The OS owns long-press contextual-menu navigation. Never bind a
+      // safety-critical action to an unverified sustained-press gesture.
+      this.cancelPendingSingleClick()
+      return
+    }
+    if (input.source !== null && input.source !== RING_EVENT_SOURCE &&
+        input.source !== EventSourceType.TOUCH_EVENT_FROM_GLASSES_R &&
+        input.source !== EventSourceType.TOUCH_EVENT_FROM_GLASSES_L) return
     if (!this.physicalPresses.accept(input)) return
+    if (input.kind === 'scroll_up' || input.kind === 'scroll_down') this.cancelPendingSingleClick()
 
     if (this.state.screen === 'inbox' && 'selectedIndex' in input && input.selectedIndex !== undefined) {
       const count = this.state.inbox?.items.length ?? 0
@@ -661,6 +727,30 @@ export class GlanceAppController {
         const currentPage = Number.isFinite(this.state.messagePage) ? Math.floor(this.state.messagePage) : 0
         const pageDelta = input.kind === 'scroll_up' ? 1 : -1
         this.state.messagePage = Math.min(lastPage, Math.max(0, currentPage + pageDelta))
+      } else if (this.state.screen === 'draft') {
+        const pages = paginateGlassesText(this.state.editorText || this.state.draft?.text || '')
+        const delta = input.kind === 'scroll_down' ? 1 : -1
+        this.state.draftPage = Math.min(pages.length - 1, Math.max(0, this.state.draftPage + delta))
+      } else if (this.state.screen === 'voice' && this.state.voicePhase === 'transcript_ready') {
+        const pages = paginateGlassesText(this.state.voiceTranscript, 46, 3)
+        const delta = input.kind === 'scroll_down' ? 1 : -1
+        this.state.transcriptPage = Math.min(pages.length - 1, Math.max(0, this.state.transcriptPage + delta))
+      } else if (this.state.screen === 'approval') {
+        if (this.state.approvalStage === 'review') {
+          if (input.kind === 'scroll_up') {
+            this.state.approvalPage = Math.max(0, this.state.approvalPage - 1)
+          } else {
+            this.advanceApprovalReview()
+          }
+        } else if (input.kind === 'scroll_up') {
+          const pages = paginateGlassesApprovalText(this.state.approvalText)
+          this.state.approvalStage = 'review'
+          this.state.approvalPage = pages.length - 1
+        }
+      } else if (this.state.screen === 'resolve') {
+        const current = Math.max(0, REASONS.findIndex((reason) => reason.value === this.state.resolveReason))
+        const delta = input.kind === 'scroll_down' ? 1 : -1
+        this.state.resolveReason = REASONS[(current + delta + REASONS.length) % REASONS.length].value
       } else {
         this.state.focusedAction = this.nextActionIndex(delta)
       }
@@ -668,15 +758,40 @@ export class GlanceAppController {
       return
     }
     if (input.kind === 'click') {
-      if (this.state.screen === 'inbox') {
-        await this.openSelectedInboxCase()
+      // Some hosts (including Simulator 0.9.5) report the first tap of a
+      // double-click as a separate click. Defer single-click navigation so
+      // the following double-click can cancel it and activate exactly once.
+      this.scheduleSingleClick(this.state.screen)
+      return
+    }
+    if (input.kind === 'double_click') {
+      this.cancelPendingSingleClick()
+      await this.activateGlassAction()
+    }
+  }
+
+  private scheduleSingleClick(screen: GlanceScreen): void {
+    this.cancelPendingSingleClick()
+    this.pendingSingleClickTimer = setTimeout(() => {
+      this.pendingSingleClickTimer = null
+      if (this.state.screen !== screen) return
+      if (screen === 'inbox') {
+        void this.openSelectedInboxCase()
+        return
+      }
+      if (screen === 'approval' && this.state.approvalStage === 'review') {
+        this.state.message = 'Read each reply page in order. Scroll down to continue.'
+        this.render()
         return
       }
       this.state.focusedAction = this.nextActionIndex(1)
       this.render()
-      return
-    }
-    if (input.kind === 'double_click') await this.activateGlassAction()
+    }, SINGLE_CLICK_SETTLE_MS)
+  }
+
+  private cancelPendingSingleClick(): void {
+    if (this.pendingSingleClickTimer !== null) clearTimeout(this.pendingSingleClickTimer)
+    this.pendingSingleClickTimer = null
   }
 
   private async handleSubmit(event: Event): Promise<void> {
@@ -737,6 +852,7 @@ export class GlanceAppController {
     if (action === 'save-owner-copy') return this.createManualDraft(this.state.editorText, Boolean(this.state.draft && this.voiceDerivedDraftIds.has(this.state.draft.draft_id)))
     if (action === 'revise') return this.reviseDraft()
     if (action === 'open-approval') return this.openApproval()
+    if (action === 'g2-safe-copy') return this.createDisplaySafeCopy()
     if (action === 'approve') return this.approveExactText()
     if (action === 'cancel-approval') {
       this.state.screen = 'draft'
@@ -754,8 +870,7 @@ export class GlanceAppController {
       return
     }
     if (action === 'cancel-resolve') {
-      this.state.screen = this.state.reply || this.state.caseData?.latest_reply ? 'status' : 'case'
-      this.render()
+      this.cancelResolve()
       return
     }
     if (action === 'back-case') {
@@ -764,8 +879,7 @@ export class GlanceAppController {
       return
     }
     if (action === 'back-inbox') {
-      this.state.screen = 'inbox'
-      this.render()
+      this.returnToInbox()
       return
     }
     if (action === 'back-draft') {
@@ -812,7 +926,7 @@ export class GlanceAppController {
     }
     if (field === 'approvalText') {
       this.state.approvalText = target.value
-      this.state.reviewedExactText = false
+      this.resetApprovalReview()
       const counter = target.closest('label')?.querySelector('.counter')
       if (counter) counter.textContent = `${[...target.value].length}/${target.maxLength}`
       const check = this.root.querySelector<HTMLInputElement>('[data-field="reviewedExactText"]')
@@ -865,6 +979,7 @@ export class GlanceAppController {
       this.state.message = 'This device is paired. Session expires ' + dateTime(session.expires_at) + '.'
       this.state.connection = 'loading'
       await this.loadInbox()
+      await this.restoreWorkspace()
     })
   }
 
@@ -872,7 +987,6 @@ export class GlanceAppController {
     if (!DEMO_FIXTURES_ENABLED) return
     await this.clearVoiceWorkflow('')
     this.sessions.clear()
-    this.keys.clear()
     this.fixtures.startDemo()
     this.api = this.fixtures
     this.state.fixtureMode = true
@@ -892,7 +1006,6 @@ export class GlanceAppController {
 
   private async stopDemo(): Promise<void> {
     await this.clearVoiceWorkflow('')
-    this.keys.clear()
     this.api = this.liveApi
     this.state.fixtureMode = false
     this.state.sessionPresent = false
@@ -908,18 +1021,23 @@ export class GlanceAppController {
     this.render()
   }
 
-  private async loadInbox(): Promise<void> {
+  private async loadInbox(polling = false): Promise<void> {
     this.pollController?.abort()
     const controller = new AbortController()
     this.pollController = controller
     if (!this.state.inbox) this.state.connection = 'loading'
     this.render()
     try {
-      const inbox = await this.api.getInbox(controller.signal)
+      const inbox = await this.api.getInbox(controller.signal, polling)
       if (controller.signal.aborted) return
-      inbox.items = sortInboxOldestFirst(inbox.items.filter((item) => item.status === 'open')).slice(0, 20)
+      const hadInbox = Boolean(this.state.inbox)
+      const previousCaseIds = new Set(this.state.inbox?.items.map((item) => item.case_id) ?? [])
+      const eligibleItems = sortInboxOldestFirst(inbox.items.filter((item) => item.status === 'open'))
+      const hasNewVisibleCase = eligibleItems.some((item) => !previousCaseIds.has(item.case_id))
+      inbox.items = eligibleItems.slice(0, 20)
       this.state.inbox = inbox
       this.state.inboxStale = false
+      this.state.newCaseAvailable = this.state.newCaseAvailable || (hadInbox && hasNewVisibleCase)
       this.state.connection = this.state.fixtureMode ? 'development-fixtures' : 'connected'
       this.state.selectedIndex = Math.min(this.state.selectedIndex, Math.max(0, inbox.items.length - 1))
       this.state.error = ''
@@ -938,12 +1056,113 @@ export class GlanceAppController {
     }
   }
 
+  private async restoreWorkspace(): Promise<void> {
+    if (this.state.fixtureMode || !this.state.sessionPresent) return
+    const saved = this.workspace.load()
+    if (!saved) return
+    try {
+      const fresh = await this.api.getCase(saved.case_id)
+      this.state.caseData = fresh
+      this.state.messagePage = 0
+      this.state.draftPage = 0
+      this.state.stale = Boolean(saved.draft && saved.draft.based_on_version !== fresh.version)
+      // Expired drafts remain available for display and for replaying an
+      // already-completed idempotent write; new approvals still fail closed.
+      const validDraft = saved.draft
+      this.state.draft = validDraft
+      this.state.editorText = validDraft?.text ?? ''
+      this.state.replyId = fresh.latest_reply?.reply_id ?? null
+      this.state.reply = null
+      this.state.focusedAction = 0
+
+      const pendingApproval = this.keys.get(`approve:${fresh.case_id}`)
+      const approvalPayload = pendingApproval?.payload as { draft_id?: unknown; text?: unknown } | undefined
+      const pendingManual = this.keys.get(`manual-draft:${fresh.case_id}`)
+      const pendingManualPayload = pendingManual?.payload as { text?: unknown } | undefined
+      const pendingRevision = validDraft ? this.keys.get(`revise:${fresh.case_id}:${validDraft.draft_id}`) : null
+      const pendingRevisionPayload = pendingRevision?.payload as { instruction?: unknown } | undefined
+      const voiceManual = this.voiceKeys.get(`voice-manual:${fresh.case_id}`)
+      const manualPayload = voiceManual?.payload as { text?: unknown } | undefined
+      const voiceRevision = this.voiceKeys.entries().find((entry) => entry.scope.startsWith(`voice-revise:${fresh.case_id}:`))
+      const revisionPayload = voiceRevision?.payload as { instruction?: unknown } | undefined
+
+      if (typeof manualPayload?.text === 'string') {
+        this.state.voicePhase = 'transcript_ready'
+        this.state.voiceTranscript = manualPayload.text
+        this.state.transcriptPage = 0
+        this.state.voiceSimulation = false
+        this.state.screen = 'voice'
+        this.state.message = 'A dictated reply request may have completed. Select Use as reply to retry the same request safely.'
+      } else if (typeof revisionPayload?.instruction === 'string') {
+        this.state.voicePhase = 'transcript_ready'
+        this.state.voiceTranscript = revisionPayload.instruction
+        this.state.transcriptPage = 0
+        this.state.voiceSimulation = false
+        this.state.screen = 'voice'
+        this.state.message = 'A revision request may have completed. Select Use as instruction to retry the same request safely.'
+      } else if (pendingApproval && typeof approvalPayload?.text === 'string' && validDraft &&
+                 approvalPayload.draft_id === validDraft.draft_id) {
+        this.state.approvalText = approvalPayload.text
+        this.state.screen = 'approval'
+        this.resetApprovalReview()
+        this.state.message = 'Approval outcome uncertain. Review every page; retry will reuse the original action key.'
+      } else if (pendingManual && typeof pendingManualPayload?.text === 'string') {
+        this.state.manualMode = true
+        this.state.editorText = pendingManualPayload.text
+        this.state.screen = 'draft'
+        this.state.message = 'A manual draft request may have completed. Save again to replay the same request safely.'
+      } else if (pendingRevision && typeof pendingRevisionPayload?.instruction === 'string') {
+        this.state.revisionInstruction = pendingRevisionPayload.instruction
+        this.state.screen = 'draft'
+        this.state.message = 'A revision may have completed. Retrying uses the same action key and instruction.'
+      } else if (saved.view === 'status' && fresh.latest_reply) {
+        this.state.screen = 'status'
+      } else {
+        this.state.screen = validDraft ? 'draft' : 'case'
+        if (saved.draft && Date.parse(saved.draft.expires_at) <= Date.now()) this.state.message = 'The saved draft expired. Create a new draft before replying.'
+        else if (this.state.stale) this.state.message = 'The case changed while Glance was inactive. Refresh context before using the saved draft.'
+      }
+      this.state.connection = this.state.fixtureMode ? 'development-fixtures' : 'connected'
+      this.render()
+    if (this.state.screen === 'status' && fresh.latest_reply) await this.fetchReply(fresh.latest_reply.reply_id, true, true)
+    } catch (error) {
+      if (this.handleLostSession(error)) return
+      this.workspace.clear()
+      this.captureError(error)
+      this.state.screen = 'inbox'
+      this.state.caseData = null
+      this.state.draft = null
+      this.render()
+    }
+  }
+
+  private persistWorkspace(): void {
+    if (this.state.fixtureMode || !this.state.sessionPresent || !this.state.caseData) return
+    if (this.state.caseData.status === 'resolved') {
+      this.workspace.clear()
+      return
+    }
+    const saved = this.workspace.load()
+    let view: WorkspaceView
+    if (this.state.screen === 'status') view = 'status'
+    else if (this.state.screen === 'draft' || this.state.screen === 'approval') view = 'draft'
+    else if (this.state.screen === 'voice' || this.state.screen === 'resolve') {
+      view = saved?.case_id === this.state.caseData.case_id
+        ? saved.view
+        : this.state.draft ? 'draft' : 'case'
+    } else view = 'case'
+    this.workspace.save(this.state.caseData.case_id, this.state.draft, view)
+  }
+
   private async openCase(caseId: string): Promise<void> {
     if (!caseId) return
     await this.withBusy('open-case', async () => {
       const data = await this.api.getCase(caseId)
       this.state.caseData = data
+      this.state.newCaseAvailable = false
       this.state.messagePage = 0
+      this.state.draftPage = 0
+      this.state.transcriptPage = 0
       this.state.stale = false
       this.state.draft = null
       this.state.editorText = ''
@@ -986,6 +1205,7 @@ export class GlanceAppController {
       if (changed && this.state.draft && this.state.draft.based_on_version !== fresh.version) {
         this.state.stale = true
         this.state.message = 'The case changed. Context refreshed; create a new draft before approving.'
+        if (this.state.screen === 'approval') this.resetApprovalReview()
       } else if (changed && showFeedback) {
         this.state.message = 'Case context refreshed from the backend.'
       }
@@ -1076,6 +1296,18 @@ export class GlanceAppController {
     }, { keepKeyOnFailure: true, keyScope: scope, keyBook })
   }
 
+  private async createDisplaySafeCopy(): Promise<void> {
+    const source = this.state.editorText || this.state.draft?.text || ''
+    if (!source || !canCreateDisplaySafeCopy(source)) return
+    const copy = glassesReviewCopy(source)
+    if (!copy || copy === source) return
+    await this.createManualDraft(copy)
+    if (this.state.draft?.text === copy && this.state.draft.source === 'owner') {
+      this.state.message = 'Display-safe owner copy saved. Review every exact page before approval.'
+      this.render()
+    }
+  }
+
   private async reviseDraft(): Promise<void> {
     const current = this.state.caseData
     const draft = this.state.draft
@@ -1120,6 +1352,8 @@ export class GlanceAppController {
     this.state.manualMode = manual || draft.source === 'owner'
     this.state.revisionInstruction = ''
     this.state.reviewedExactText = false
+    this.state.draftPage = 0
+    this.state.focusedAction = 0
     this.state.stale = false
     this.state.screen = 'draft'
     this.state.message = `Draft saved · expires ${dateTime(draft.expires_at)} · not sent.`
@@ -1147,8 +1381,11 @@ export class GlanceAppController {
       this.failLocal(error instanceof Error ? error.message : 'Review the exact reply text.', 'invalid_text')
       return
     }
-    this.state.reviewedExactText = false
+    this.state.approvalPage = 0
+    this.state.approvalProgress = 0
+    this.state.approvalStage = 'review'
     this.state.screen = 'approval'
+    this.resetApprovalReview()
     this.render()
   }
 
@@ -1156,7 +1393,7 @@ export class GlanceAppController {
     const current = this.state.caseData
     const draft = this.state.draft
     if (!current || !draft || !this.state.reviewedExactText || this.state.busy) {
-      if (!this.state.reviewedExactText) this.failLocal('Read the full customer-facing text on the phone and confirm before queueing.', 'review_required')
+      if (!this.state.reviewedExactText) this.failLocal('Review every exact-text page on G2 or use the optional companion editor.', 'review_required')
       return
     }
     let text: string
@@ -1166,29 +1403,44 @@ export class GlanceAppController {
       this.failLocal(error instanceof Error ? error.message : 'Review the exact reply text.', 'invalid_text')
       return
     }
-    const fresh = await this.refreshCase()
-    if (!fresh || fresh.status !== 'open') return
-    if (fresh.version !== current.version || fresh.version !== draft.based_on_version || this.state.stale) {
+    if (this.approvalSnapshot !== text || this.approvalDraftSnapshot !== draft.draft_id) {
+      this.resetApprovalReview()
+      this.failLocal('The reply changed after review. Start the full review again.', 'review_required')
+      return
+    }
+    const scope = `approve:${current.case_id}`
+    const pending = this.keys.get(scope)
+    const pendingPayload = pending?.payload as { expected_version?: unknown; draft_id?: unknown; text?: unknown } | undefined
+    const isReplay = Boolean(pending && pendingPayload &&
+      pendingPayload.draft_id === draft.draft_id && pendingPayload.text === text &&
+      typeof pendingPayload.expected_version === 'number')
+    if (pending && !isReplay) {
+      this.failLocal('An earlier approval is uncertain. Reopen and review its exact text before retrying.', 'uncertain_action')
+      return
+    }
+    // A matching durable key must be replayed before mutable case/draft checks:
+    // the backend returns a completed result before validating current state.
+    const fresh = isReplay ? current : await this.refreshCase()
+    if (!fresh || (!isReplay && fresh.status !== 'open')) return
+    if (!isReplay && (fresh.version !== current.version || fresh.version !== draft.based_on_version || this.state.stale)) {
       this.state.stale = true
       this.state.screen = 'case'
       this.state.message = 'Approval stopped because the case changed. Review the latest context and create a new draft.'
       this.render()
       return
     }
-    const voiceDerived = this.voiceDerivedDraftIds.has(draft.draft_id)
-    const scope = `approve:${fresh.case_id}`
-    const keyBook = voiceDerived ? this.voiceKeys : this.keys
-    const payload = { expected_version: fresh.version, draft_id: draft.draft_id, text }
+    const expectedVersion = isReplay ? pendingPayload!.expected_version as number : fresh.version
+    const payload = { expected_version: expectedVersion, draft_id: draft.draft_id, text }
     let key: string
     try {
-      key = keyBook.acquire(scope, payload)
+      key = this.keys.acquire(scope, payload)
     } catch (error) {
       this.failLocal(error instanceof Error ? error.message : 'Retry the original approval text.', 'uncertain_action')
       return
     }
     await this.withBusy('approve', async () => {
-      const result = await this.api.approveReply(fresh.case_id, fresh.version, draft.draft_id, text, key)
-      keyBook.complete(scope)
+      const result = await this.api.approveReply(current.case_id, expectedVersion, draft.draft_id, text, key)
+      this.keys.complete(scope)
       this.state.replyId = result.reply_id
       this.state.reply = {
         reply_id: result.reply_id,
@@ -1212,11 +1464,12 @@ export class GlanceAppController {
         delivered_at: null,
       } }
       this.state.screen = 'status'
+      this.workspace.save(current.case_id, this.state.draft, 'status')
       this.state.autoPolls = 0
       this.state.message = 'Reply queued. It has not been confirmed delivered.'
       await this.refreshCase()
       await this.fetchReply(result.reply_id, true)
-    }, { keepKeyOnFailure: true, keyScope: scope, keyBook })
+    }, { keepKeyOnFailure: true, keyScope: scope, keyBook: this.keys })
   }
 
   private async recoverReply(): Promise<void> {
@@ -1254,10 +1507,17 @@ export class GlanceAppController {
     await this.fetchReply(replyId, true)
   }
 
-  private async fetchReply(replyId: string, schedule: boolean): Promise<void> {
+  private async fetchReply(replyId: string, schedule: boolean, polling = false): Promise<void> {
+    if (this.replyController) {
+      if (this.replyControllerId !== replyId) this.pendingReplyFetch = { replyId, schedule, polling }
+      return
+    }
     this.clearReplyTimer()
+    const controller = new AbortController()
+    this.replyController = controller
+    this.replyControllerId = replyId
     try {
-      const reply = await this.api.getReply(replyId)
+      const reply = await this.api.getReply(replyId, controller.signal, polling)
       this.state.reply = reply
       this.state.replyId = reply.reply_id
       if (this.state.caseData?.case_id === reply.case_id && this.state.caseData.latest_reply?.reply_id === reply.reply_id) {
@@ -1280,7 +1540,7 @@ export class GlanceAppController {
         this.state.autoPolls += 1
         this.replyTimer = window.setTimeout(() => {
           if (this.foreground && document.visibilityState === 'visible' && this.state.screen === 'status') {
-            void this.fetchReply(replyId, true)
+            void this.fetchReply(replyId, true, true)
           }
         }, delay)
       } else if (shouldPollReply(reply.state) && this.state.autoPolls >= 5) {
@@ -1290,10 +1550,21 @@ export class GlanceAppController {
       }
       this.render()
     } catch (error) {
+      if (controller.signal.aborted) return
       this.state.connection = 'offline'
       this.captureError(error)
       this.handleLostSession(error)
       this.render()
+    } finally {
+      if (this.replyController === controller) {
+        this.replyController = null
+        this.replyControllerId = null
+      }
+      const pending = this.pendingReplyFetch
+      this.pendingReplyFetch = null
+      if (pending && this.foreground && document.visibilityState === 'visible') {
+        void this.fetchReply(pending.replyId, pending.schedule, pending.polling)
+      }
     }
   }
 
@@ -1343,6 +1614,7 @@ export class GlanceAppController {
         feedback = 'Case marked resolved. This does not change payment state.'
       }
       await this.loadInbox()
+      this.workspace.clear()
       this.state.message = feedback
       this.render()
     })
@@ -1351,6 +1623,7 @@ export class GlanceAppController {
   private enterResolveScreen(): void {
     this.state.focusedAction = 0
     this.state.acknowledgedUnknown = false
+    this.state.resolveReason = 'handled_in_person'
     this.state.screen = 'resolve'
     this.render()
   }
@@ -1364,9 +1637,8 @@ export class GlanceAppController {
     await this.withBusy('revoke-session', async () => {
       await this.clearVoiceWorkflow('')
       await this.liveApi.revokeCurrentSession()
-      this.keys.clear()
-      this.voiceKeys.clear()
       this.voiceDerivedDraftIds.clear()
+      this.workspace.clear()
       this.state.sessionPresent = false
       this.state.screen = 'pair'
       this.state.salonName = ''
@@ -1470,81 +1742,134 @@ export class GlanceAppController {
 
   private handleLostSession(error: unknown): boolean {
     if (!(error instanceof ApiError) || !['invalid_session', 'session_expired', 'session_revoked', 'owner_not_authorized'].includes(error.code)) return false
-    if (!this.sessions.load()) {
-      void this.clearVoiceWorkflow('')
-      this.voiceDerivedDraftIds.clear()
-      this.keys.clear()
-      this.voiceKeys.clear()
-      this.state.sessionPresent = false
-      this.state.screen = 'pair'
-      this.state.salonName = ''
-      this.state.message = 'Session ended. Pair this device again through Telegram.'
-      this.state.inbox = null
-      this.state.caseData = null
-      this.state.draft = null
-      this.state.reply = null
-      this.state.replyId = null
-      this.render()
-      return true
-    }
-    return false
+    this.sessions.clear()
+    void this.clearVoiceWorkflow('')
+    this.voiceDerivedDraftIds.clear()
+    this.state.sessionPresent = false
+    this.state.screen = 'pair'
+    this.state.salonName = ''
+    this.state.message = 'Session ended. Pair this device again through Telegram.'
+    this.state.inbox = null
+    this.state.caseData = null
+    this.state.draft = null
+    this.state.editorText = ''
+    this.state.reply = null
+    this.state.replyId = null
+    // Keep pending idempotency records so an uncertain write retains its
+    // original key and payload for reconciliation after re-pairing.
+    this.render()
+    return true
   }
 
   private async onVisibilityChange(): Promise<void> {
     this.foreground = document.visibilityState === 'visible'
     if (this.foreground) await this.onForegroundResume()
     else {
+      this.cancelPendingSingleClick()
       this.clearReplyTimer()
+      this.pollController?.abort()
+      this.statusController?.abort()
+      this.replyController?.abort()
+      this.pendingReplyFetch = null
+      if (this.state.screen === 'approval') this.resetApprovalReview()
       await this.stopForBackground()
     }
   }
 
   private async onForegroundResume(): Promise<void> {
-    if (!this.foreground || document.visibilityState === 'hidden') return
+    if (!this.foreground || document.visibilityState === 'hidden' || this.foregroundRefreshInProgress) return
+    this.foregroundRefreshInProgress = true
+    try {
     const session = this.state.fixtureMode ? null : this.sessions.load()
     if (!this.state.fixtureMode && !session && this.state.sessionPresent) {
-      this.state.sessionPresent = false
-      this.state.screen = 'pair'
-      this.state.message = 'Session expired. Pair this device again through Telegram.'
-      await this.clearVoiceWorkflow('')
-      this.voiceDerivedDraftIds.clear()
-      this.render()
+      this.expireLocalSession()
       return
     }
+    this.restorePendingVoiceIntent()
     if (this.state.screen === 'inbox') await this.loadInbox()
     else if (this.state.caseData && ['case', 'voice', 'draft', 'approval', 'resolve', 'status'].includes(this.state.screen)) {
       await this.refreshCaseStatus()
-      if (this.state.screen === 'status' && this.state.replyId) await this.fetchReply(this.state.replyId, true)
+      if (this.state.screen === 'status' && this.state.replyId) await this.fetchReply(this.state.replyId, true, true)
+    }
+    } finally {
+      this.foregroundRefreshInProgress = false
     }
   }
 
-  private async pollVisibleState(): Promise<void> {
-    if (!this.foreground || document.visibilityState !== 'visible' || this.state.busy) return
-    if (!this.state.fixtureMode && this.state.sessionPresent && !this.sessions.load()) {
-      this.state.sessionPresent = false
-      this.state.screen = 'pair'
-      this.state.message = 'Session expired. Pair this device again through Telegram.'
-      void this.clearVoiceWorkflow('')
-      this.voiceDerivedDraftIds.clear()
+  private restorePendingVoiceIntent(): void {
+    if (this.state.busy || !this.state.caseData) return
+    const caseId = this.state.caseData.case_id
+    const manual = this.voiceKeys.get(`voice-manual:${caseId}`)?.payload as { text?: unknown } | undefined
+    if (typeof manual?.text === 'string') {
+      this.state.voicePhase = 'transcript_ready'
+      this.state.voiceTranscript = manual.text
+      this.state.transcriptPage = 0
+      this.state.voiceSimulation = false
+      this.state.screen = 'voice'
+      this.state.message = 'A dictated reply request may have completed. Select Use as reply to retry the same request safely.'
       this.render()
       return
     }
+    const revision = this.voiceKeys.entries().find((entry) => entry.scope.startsWith(`voice-revise:${caseId}:`))
+    const instruction = (revision?.payload as { instruction?: unknown } | undefined)?.instruction
+    if (typeof instruction === 'string') {
+      this.state.voicePhase = 'transcript_ready'
+      this.state.voiceTranscript = instruction
+      this.state.transcriptPage = 0
+      this.state.voiceSimulation = false
+      this.state.screen = 'voice'
+      this.state.message = 'A revision request may have completed. Select Use as instruction to replay it safely.'
+      this.render()
+    }
+  }
+
+  private expireLocalSession(): void {
+    this.sessions.clear()
+    void this.clearVoiceWorkflow('')
+    this.voiceDerivedDraftIds.clear()
+    this.state.sessionPresent = false
+    this.state.screen = 'pair'
+    this.state.salonName = ''
+    this.state.message = 'Session expired. Pair this device again through Telegram.'
+    this.state.inbox = null
+    this.state.caseData = null
+    this.state.draft = null
+    this.state.editorText = ''
+    this.state.reply = null
+    this.state.replyId = null
+    this.render()
+  }
+
+  private async pollVisibleState(): Promise<void> {
+    if (!this.foreground || document.visibilityState !== 'visible' || this.state.busy || this.pollInProgress || this.pollController) return
+    this.pollInProgress = true
+    try {
+    if (!this.state.fixtureMode && this.state.sessionPresent && !this.sessions.load()) {
+      this.expireLocalSession()
+      return
+    }
     if (this.state.screen === 'inbox' && this.state.sessionPresent || this.state.screen === 'inbox' && this.state.fixtureMode) {
-      await this.loadInbox()
+      await this.loadInbox(true)
     } else if (['case', 'voice', 'draft', 'approval', 'resolve', 'status'].includes(this.state.screen) && this.state.caseData) {
       await this.refreshCaseStatus()
+    }
+    } finally {
+      this.pollInProgress = false
     }
   }
 
   private async refreshCaseStatus(): Promise<void> {
     const current = this.state.caseData
-    if (!current) return
+    if (!current || this.statusRefreshInProgress) return
+    this.statusRefreshInProgress = true
+    const controller = new AbortController()
+    this.statusController = controller
     try {
-      const status = await this.api.getCaseStatus(current.case_id)
+      const status = await this.api.getCaseStatus(current.case_id, controller.signal, true)
       if (this.state.caseData?.case_id !== current.case_id) return
       if (status.version !== current.version || status.status !== current.status) {
         await this.refreshCase()
-        if (this.state.screen === 'status' && this.state.replyId) await this.fetchReply(this.state.replyId, true)
+        if (this.state.screen === 'status' && this.state.replyId) await this.fetchReply(this.state.replyId, true, true)
         return
       }
 
@@ -1557,11 +1882,11 @@ export class GlanceAppController {
       if (previous && previous.reply_id === latest.reply_id && previous.state === latest.state &&
           previous.updated_at === latest.updated_at) return
       if (this.state.screen === 'status') {
-        await this.fetchReply(latest.reply_id, true)
+        await this.fetchReply(latest.reply_id, true, true)
         return
       }
 
-      const reply = await this.api.getReply(latest.reply_id)
+      const reply = await this.api.getReply(latest.reply_id, controller.signal, true)
       if (this.state.caseData?.case_id !== current.case_id) return
       this.state.reply = reply
       this.state.replyId = reply.reply_id
@@ -1580,10 +1905,14 @@ export class GlanceAppController {
       this.state.connection = this.state.fixtureMode ? 'development-fixtures' : 'connected'
       this.render()
     } catch (error) {
+      if (controller.signal.aborted) return
       this.state.connection = 'offline'
       this.captureError(error)
       this.handleLostSession(error)
       this.render()
+    } finally {
+      if (this.statusController === controller) this.statusController = null
+      this.statusRefreshInProgress = false
     }
   }
 
@@ -1593,10 +1922,14 @@ export class GlanceAppController {
   }
 
   private async activateGlassAction(): Promise<void> {
-    const selected = this.state.focusedAction
+    const actionCount = this.glassActionCount()
+    const selected = Number.isInteger(this.state.focusedAction)
+      ? Math.min(actionCount - 1, Math.max(0, this.state.focusedAction))
+      : 0
+    this.state.focusedAction = selected
     switch (this.state.screen) {
-      // A single click opens the selected row. Keep root double-click for the
-      // Even Hub root-page exit behavior.
+      // Inbox is the root page: single click opens the native selection and
+      // double click must always invoke the Even Hub system exit confirmation.
       case 'inbox':
         if (this.pageShutdownControl) {
           try {
@@ -1609,15 +1942,14 @@ export class GlanceAppController {
       case 'case':
         if (this.state.caseData?.status === 'resolved') {
           if (selected === 0 && this.state.caseData.latest_reply) return this.openLatestReply()
-          if (selected === 1 || !this.state.caseData.latest_reply) { this.state.screen = 'inbox'; this.render(); return }
+          if (selected === 1 || !this.state.caseData.latest_reply) { this.returnToInbox(); return }
           return
         }
         if (selected === 0) return this.generateDraft()
-        if (selected === 1) return this.beginManualDraft()
-        if (selected === 2) return this.enterVoiceReady()
-        if (selected === 3) return this.openLatestReply()
-        if (selected === 4) { this.enterResolveScreen(); return }
-        if (selected === 5) { this.state.screen = 'inbox'; this.render(); return }
+        if (selected === 1) return this.enterVoiceReady()
+        if (selected === 2) return this.openLatestReply()
+        if (selected === 3) { const fresh = await this.refreshCase(); if (fresh) this.enterResolveScreen(); return }
+        if (selected === 4) { this.returnToInbox(); return }
         break
       case 'voice':
         if (this.state.voicePhase === 'recording') {
@@ -1628,9 +1960,13 @@ export class GlanceAppController {
             this.render()
           }
         } else if (this.state.voicePhase === 'transcript_ready') {
-          if (selected === 0) this.state.message = 'Choose Use as reply or Use as instruction on the phone.'
-          else this.state.message = 'The full transcript is shown on the paired phone.'
-          this.render()
+          if (selected === 0) return this.useVoiceTranscriptAsReply()
+          if (selected === 1) return this.useVoiceTranscriptAsInstruction()
+          if (selected === 2) {
+            await this.clearVoiceWorkflow('Transcript discarded. It was not saved or sent.')
+            this.state.screen = 'case'
+            this.render()
+          }
         } else if (this.state.voicePhase === 'error' || this.state.voicePhase === 'idle') {
           if (selected === 0) return this.state.fixtureMode ? this.beginDemoRecording() : this.beginVoiceCapture()
           if (selected === 1) {
@@ -1642,37 +1978,200 @@ export class GlanceAppController {
         break
       case 'draft':
         if (selected === 0) return this.openApproval()
-        if (selected === 1) { this.state.screen = 'case'; this.render(); return }
+        if (selected === 1) return this.enterVoiceReady()
+        if (selected === 2) { this.state.screen = 'case'; this.render(); return }
+        if (selected === 3) return this.createDisplaySafeCopy()
         break
       case 'approval':
-        if (selected === 0) {
-          this.state.message = 'Review and approve the exact outgoing text on the paired phone.'
+        if (this.state.approvalStage === 'review') {
+          this.state.message = 'Read the complete text in order. Swipe down to advance; approval is a separate step.'
           this.render()
           return
         }
-        if (selected === 1) { this.state.screen = 'draft'; this.render(); return }
+        if (hasUncertainApproval(this.state)) {
+          if (selected === 0) return this.recoverReply()
+          if (selected === 1) return this.retryUncertainAction()
+          this.returnToDraft()
+          return
+        }
+        if (this.canApproveFromGlasses() && selected === 0) {
+          this.state.reviewedExactText = true
+          return this.approveExactText()
+        }
+        this.returnToDraft()
         break
       case 'status':
         if (selected === 0) return this.checkReplyStatus()
         if (selected === 1) { this.enterResolveScreen(); return }
-        if (selected === 2) { this.state.screen = 'inbox'; this.render(); return }
+        if (selected === 2) { this.state.screen = 'case'; this.render(); return }
         break
       case 'resolve':
+        if (selected === 1) { this.cancelResolve(); return }
+        if (this.state.caseData?.latest_reply?.state === 'unknown' && !this.state.acknowledgedUnknown) {
+          this.state.acknowledgedUnknown = true
+          this.state.focusedAction = 0
+          this.state.message = 'Uncertainty acknowledged. Confirm resolution in a separate action.'
+          this.render()
+          return
+        }
         if (selected === 0) return this.resolveCase()
-        if (selected === 1) { this.state.screen = 'case'; this.render(); return }
-        this.state.focusedAction = 0
-        this.render()
         break
       case 'pair': return
     }
   }
 
   private nextActionIndex(delta: number): number {
-    const counts: Record<GlanceScreen, number> = { pair: 1, inbox: 1, case: 6, voice: 2, draft: 2, approval: 2, status: 3, resolve: 2 }
-    const count = this.state.screen === 'case' && this.state.caseData?.status === 'resolved'
-      ? 2
-      : counts[this.state.screen]
-    return (this.state.focusedAction + delta + count) % count
+    const count = this.glassActionCount()
+    const current = Number.isInteger(this.state.focusedAction)
+      ? Math.min(count - 1, Math.max(0, this.state.focusedAction))
+      : 0
+    return (current + delta + count) % count
+  }
+
+  private glassActionCount(): number {
+    switch (this.state.screen) {
+      case 'case': return this.state.caseData?.status === 'resolved' ? (this.state.caseData.latest_reply ? 2 : 1) : 5
+      case 'voice': return this.state.voicePhase === 'transcript_ready' ? 3 : 2
+      case 'draft': return needsGlassesReviewCopy(this.state.editorText || this.state.draft?.text || '') ? 4 : 3
+      case 'approval': return this.state.approvalStage === 'review' ? 1 : hasUncertainApproval(this.state)
+        ? 3 : (this.canApproveFromGlasses() ? 2 : 1)
+      case 'status': return 3
+      case 'resolve': return 2
+      default: return 1
+    }
+  }
+
+  private canApproveFromGlasses(): boolean {
+    const item = this.state.caseData
+    const draft = this.state.draft
+    const pages = paginateGlassesApprovalText(this.state.approvalText)
+    const pending = item ? this.keys.get(`approve:${item.case_id}`) : null
+    const payload = pending?.payload as { expected_version?: unknown; draft_id?: unknown; text?: unknown } | undefined
+    const replay = Boolean(payload && typeof payload.expected_version === 'number' &&
+      payload.draft_id === draft?.draft_id && payload.text === this.state.approvalText)
+    const currentDraft = Boolean(item && draft && item.status === 'open' && !this.state.stale &&
+      draft.based_on_version === item.version && Date.parse(draft.expires_at) > Date.now())
+    return this.state.screen === 'approval' && this.state.approvalStage === 'confirm' &&
+      this.state.approvalProgress >= pages.length - 1 && Boolean(item && draft && (currentDraft || replay) &&
+        /^[\x20-\x7e\n]+$/.test(this.state.approvalText) &&
+        this.approvalSnapshot === this.state.approvalText && this.approvalDraftSnapshot === draft.draft_id)
+  }
+
+  private advanceApprovalReview(): void {
+    const pages = paginateGlassesApprovalText(this.state.approvalText)
+    const last = pages.length - 1
+    if (this.state.approvalPage < last) {
+      this.state.approvalPage += 1
+      this.state.approvalProgress = Math.max(this.state.approvalProgress, this.state.approvalPage)
+    } else if (this.state.approvalProgress >= last) {
+      this.state.approvalStage = 'confirm'
+      this.state.focusedAction = 0
+      this.state.message = 'Review complete. Choose Approve & Queue, then confirm separately.'
+    }
+  }
+
+  private resetApprovalReview(): void {
+    this.state.approvalPage = 0
+    this.state.approvalProgress = 0
+    this.state.approvalStage = 'review'
+    this.state.reviewedExactText = false
+    this.approvalSnapshot = this.state.approvalText
+    this.approvalDraftSnapshot = this.state.draft?.draft_id ?? ''
+  }
+
+  private returnToInbox(): void {
+    this.state.screen = 'inbox'
+    this.state.caseData = null
+    this.state.draft = null
+    this.state.editorText = ''
+    this.state.reply = null
+    this.state.replyId = null
+    this.workspace.clear()
+    this.render()
+    void this.loadInbox()
+  }
+
+  private returnToDraft(): void {
+    this.state.screen = 'draft'
+    this.state.reviewedExactText = false
+    this.state.approvalStage = 'review'
+    this.render()
+  }
+
+  private cancelResolve(): void {
+    this.state.acknowledgedUnknown = false
+    this.state.screen = 'case'
+    this.render()
+  }
+
+  private async activateGlassMenuItem(itemId: number): Promise<void> {
+    if (itemId === G2_MENU.inboxOpen) {
+      if (this.state.inbox?.items.length) await this.openSelectedInboxCase()
+      else await this.loadInbox()
+      return
+    }
+    if (itemId === G2_MENU.aiDraft && this.state.screen === 'case') return this.generateDraft()
+    if (itemId === G2_MENU.voiceReply && this.state.screen === 'case') return this.enterVoiceReady()
+    if (itemId === G2_MENU.replyStatus && ['case', 'draft'].includes(this.state.screen)) return this.openLatestReply()
+    if (itemId === G2_MENU.resolve || itemId === G2_MENU.statusResolve) {
+      const fresh = await this.refreshCase()
+      if (fresh) this.enterResolveScreen()
+      return
+    }
+    if (itemId === G2_MENU.inbox || itemId === G2_MENU.draftCase || itemId === G2_MENU.statusCase) {
+      if (this.state.screen === 'case') this.returnToInbox()
+      else { this.state.screen = 'case'; this.render() }
+      return
+    }
+    if (itemId === G2_MENU.draftReview && this.state.screen === 'draft') return this.openApproval()
+    if (itemId === G2_MENU.draftVoice && this.state.screen === 'draft') return this.enterVoiceReady()
+    if (itemId === G2_MENU.draftSafeCopy && this.state.screen === 'draft') return this.createDisplaySafeCopy()
+    if (itemId === G2_MENU.voiceStart && this.state.screen === 'voice') {
+      if (this.state.voicePhase === 'error') { this.state.voicePhase = 'idle'; this.state.focusedAction = 0 }
+      return this.state.voiceSimulation ? this.beginDemoRecording() : this.beginVoiceCapture()
+    }
+    if (itemId === G2_MENU.voiceStop && this.state.screen === 'voice') {
+      return this.state.voiceSimulation ? this.stopDemoRecording() : this.stopAndTranscribe('owner')
+    }
+    if (itemId === G2_MENU.voiceCancel && this.state.screen === 'voice') {
+      await this.clearVoiceWorkflow('Voice activity cancelled. Audio and unselected transcript were cleared.')
+      this.state.screen = 'case'
+      this.render()
+      return
+    }
+    if (itemId === G2_MENU.transcriptReply && this.state.screen === 'voice') return this.useVoiceTranscriptAsReply()
+    if (itemId === G2_MENU.transcriptInstruction && this.state.screen === 'voice') return this.useVoiceTranscriptAsInstruction()
+    if (itemId === G2_MENU.approvalPrevious && this.state.screen === 'approval') {
+      this.state.approvalPage = Math.max(0, this.state.approvalPage - 1)
+      this.state.approvalStage = 'review'
+      this.render()
+      return
+    }
+    if (itemId === G2_MENU.approvalNext && this.state.screen === 'approval') {
+      this.advanceApprovalReview()
+      this.render()
+      return
+    }
+    if (itemId === G2_MENU.approvalConfirm && this.canApproveFromGlasses()) {
+      this.state.reviewedExactText = true
+      return this.approveExactText()
+    }
+    if (itemId === G2_MENU.approvalStatus && this.state.screen === 'approval' && hasUncertainApproval(this.state)) return this.recoverReply()
+    if (itemId === G2_MENU.approvalRetry && this.state.screen === 'approval' && hasUncertainApproval(this.state)) return this.retryUncertainAction()
+    if (itemId === G2_MENU.approvalCancel && this.state.screen === 'approval') return this.returnToDraft()
+    if (itemId === G2_MENU.statusCheck && this.state.screen === 'status') return this.checkReplyStatus()
+    if (itemId === G2_MENU.reasonHandled) this.state.resolveReason = 'handled_in_person'
+    else if (itemId === G2_MENU.reasonUpdated) this.state.resolveReason = 'customer_updated'
+    else if (itemId === G2_MENU.reasonNoAction) this.state.resolveReason = 'no_action_needed'
+    else if (itemId === G2_MENU.reasonOther) this.state.resolveReason = 'other'
+    else if (itemId === G2_MENU.resolveAcknowledge && this.state.screen === 'resolve') {
+      this.state.acknowledgedUnknown = true
+      this.state.focusedAction = 0
+      this.state.message = 'Uncertainty acknowledged. Confirm resolution in a separate action.'
+    } else if (itemId === G2_MENU.resolveConfirm && this.state.screen === 'resolve') return this.resolveCase()
+    else if (itemId === G2_MENU.resolveCancel && this.state.screen === 'resolve') return this.cancelResolve()
+    else return
+    this.render()
   }
 
   private render(): void {
@@ -1680,6 +2179,7 @@ export class GlanceAppController {
     this.renderedScreen = this.state.screen
     if (previousScreen === 'voice' && this.state.screen !== 'voice') void this.clearVoiceWorkflow('')
     this.root.innerHTML = this.renderScreen()
+    this.persistWorkspace()
     this.updateGlasses()
   }
 
@@ -1698,7 +2198,7 @@ export class GlanceAppController {
       this.state.screen === 'draft' ? this.renderDraft() :
       this.state.screen === 'approval' ? this.renderApproval() :
       this.state.screen === 'status' ? this.renderStatus() : this.renderResolve()
-    return `${fixtureBanner}${header}<main class="layout"><section class="phone-shell"><div class="phone-screen">${screen}${error}${message}</div></section><aside class="glance-hint"><p class="eyebrow">ON YOUR G2</p><h2>One decision at a glance.</h2><p>Use scroll to move through cases or message chunks. Click changes the highlighted action; double-click opens it.</p><div class="control-key"><span>SCROLL</span><b>Choose / page</b></div><div class="control-key"><span>CLICK</span><b>Focus action</b></div><div class="control-key"><span>DOUBLE</span><b>Activate action</b></div><p class="hint-small">Full text, forms, and exact approval review stay on the paired phone.</p></aside></main>${footer}`
+    return `${fixtureBanner}${header}<main class="layout"><section class="phone-shell"><div class="phone-screen">${screen}${error}${message}</div></section><aside class="glance-hint"><p class="eyebrow">GLASSES FIRST</p><h2>Handle escalations on G2.</h2><p>Swipe to browse or page. Click highlights an action; double-click activates it. The inbox opens a selected case on one click.</p><div class="control-key"><span>SWIPE</span><b>Browse / page</b></div><div class="control-key"><span>CLICK</span><b>Choose action</b></div><div class="control-key"><span>DOUBLE</span><b>Confirm action</b></div><p class="hint-small">Pairing, recovery and optional full-text editing are available here. The ordinary reply and approval flow stays on the glasses.</p></aside></main>${footer}`
   }
 
   private renderPair(): string {
@@ -1713,7 +2213,7 @@ export class GlanceAppController {
     const list = items.length ? `<div class="case-list">${items.map((item, index) => `<article class="case-row ${index === this.state.selectedIndex ? 'selected' : ''}"><button class="case-open" data-action="open-case" data-case-id="${escapeHtml(item.case_id)}"><span class="customer">${escapeHtml(item.customer_label)}</span><span class="case-age">${escapeHtml(this.age(item.created_at))}</span><span class="case-category">${escapeHtml(categoryLabel(item.category))} · ${escapeHtml(item.channel.toUpperCase())}</span><span class="preview">${escapeHtml(item.preview)}</span><span class="open-chevron">Open →</span></button></article>`).join('')}</div>` : `<div class="empty-state"><div class="empty-icon">✓</div><h2>${this.state.connection === 'loading' ? 'Loading your inbox' : 'You are all caught up'}</h2><p>${this.state.connection === 'loading' ? 'Checking for open owner escalations.' : 'No open cases need your attention right now.'}</p></div>`
     const count = inbox ? inbox.open_count : '—'
     const more = inbox?.has_more ? `<p class="more-note">Showing ${items.length} oldest open cases · ${moreCaseCount(inbox.open_count, items.length)} more not shown.</p>` : ''
-    return `<section class="panel inbox-panel"><div class="section-heading"><div><p class="eyebrow">${this.state.fixtureMode ? 'SYNTHETIC INBOX' : 'OWNER INBOX'}</p><h1>Open cases</h1></div><div class="count-pill"><strong>${escapeHtml(count)}</strong><span>open</span></div></div>${stale}${list}${more}<div class="button-row">${button('Refresh', 'refresh-inbox')}${items.length ? button('Open selected case', 'open-selected', { primary: true }) : ''}</div><p class="poll-note">Inbox refreshes every five seconds while this screen is visible. New cases may take time to appear.</p></section>`
+    return `<section class="panel inbox-panel"><div class="section-heading"><div><p class="eyebrow">${this.state.fixtureMode ? 'SYNTHETIC INBOX' : 'OWNER INBOX'}</p><h1>Open cases</h1></div><div class="count-pill"><strong>${escapeHtml(count)}</strong><span>open</span></div></div>${stale}${list}${more}<div class="button-row">${button('Refresh', 'refresh-inbox')}${items.length ? button('Open selected case', 'open-selected', { primary: true }) : ''}</div><p class="poll-note">Inbox checks every 30 seconds while visible. New cases may take time to appear.</p></section>`
   }
 
   private renderCase(): string {
@@ -1756,7 +2256,7 @@ export class GlanceAppController {
       const transcriptNote = this.state.voiceSimulation ? '<p class="warning-card">Synthetic walkthrough text · no microphone or ASR was used. This demo cannot contact customers.</p>' : ''
       const againAction = this.state.voiceSimulation ? 'start-demo-recording' : 'start-voice'
       const againLabel = this.state.voiceSimulation ? 'Start simulated capture again' : 'Record again'
-      return `<section class="panel voice-panel"><button class="text-button back-link" data-action="voice-back-case">← Case</button><p class="eyebrow">${transcriptLabel}</p><h1>Choose what you meant</h1>${transcriptNote}<div class="voice-facts"><span>Captured ${duration}</span><span>${this.state.voiceSimulation ? 'Simulated' : 'Transcription'} ${this.state.voiceTranscriptionDurationMs ?? 0} ms</span></div><label for="voice-transcript">${this.state.voiceSimulation ? 'Synthetic words' : 'Recognized words'}</label><textarea id="voice-transcript" class="transcript-text" rows="6" readonly>${escapeHtml(this.state.voiceTranscript)}</textarea><div class="intent-cards"><div><h2>Use as reply</h2><p>Create an owner-authored draft from these words. You can edit the full reply before approval.</p>${button('Use as reply', 'use-transcript-reply', { primary: true, disabled: this.state.busy || item.status !== 'open' })}</div><div><h2>Use as instruction</h2><p>${escapeHtml(instructionWhy)}</p>${button('Use as instruction', 'use-transcript-instruction', { disabled: this.state.busy || !canInstruction })}</div></div><p class="subtle">Neither choice sends a message. Exact outgoing text still requires your separate approval.</p>${button(againLabel, againAction)}</section>`
+      return `<section class="panel voice-panel"><button class="text-button back-link" data-action="voice-back-case">← Case</button><p class="eyebrow">${transcriptLabel}</p><h1>Choose what you meant</h1>${transcriptNote}<div class="voice-facts"><span>Captured ${duration}</span><span>${this.state.voiceSimulation ? 'Simulated' : 'Transcription'} ${this.state.voiceTranscriptionDurationMs ?? 0} ms</span></div><label for="voice-transcript">${this.state.voiceSimulation ? 'Synthetic words' : 'Recognized words'}</label><textarea id="voice-transcript" class="transcript-text" rows="6" readonly>${escapeHtml(this.state.voiceTranscript)}</textarea><div class="intent-cards"><div><h2>Use as reply</h2><p>Create an owner-authored draft from these words. Review and approve it on G2; phone editing is optional.</p>${button('Use as reply', 'use-transcript-reply', { primary: true, disabled: this.state.busy || item.status !== 'open' })}</div><div><h2>Use as instruction</h2><p>${escapeHtml(instructionWhy)}</p>${button('Use as instruction', 'use-transcript-instruction', { disabled: this.state.busy || !canInstruction })}</div></div><p class="subtle">Neither choice sends a message. The G2 review and final approval are separate actions.</p>${button(againLabel, againAction)}</section>`
     }
     if (phase === 'starting' || phase === 'stopping' || phase === 'transcribing') {
       const label = phase === 'starting' ? 'Starting microphone' : phase === 'stopping' ? 'Stopping microphone' : 'Transcribing'
@@ -1769,7 +2269,7 @@ export class GlanceAppController {
     }
     const startAction = this.state.voiceSimulation ? 'start-demo-recording' : 'start-voice'
     const startLabel = this.state.voiceSimulation ? 'Start simulated capture' : 'Start G2 recording'
-    return `<section class="panel voice-panel"><button class="text-button back-link" data-action="voice-back-case">← Case</button><p class="eyebrow">${this.state.voiceSimulation ? 'SIMULATED VOICE PREVIEW' : 'OWNER-STARTED VOICE'}</p><h1>Ready to record</h1><p class="lead">${this.state.voiceSimulation ? 'Preview only. No microphone or ASR will run.' : 'The G2 microphone stays off until you choose Start. Speak briefly, stop, then review the transcript on your phone.'}</p>${button(startLabel, startAction, { primary: true, disabled: this.state.busy || (!this.state.voiceSimulation && !this.state.glassesAvailable) })}</section>`
+    return `<section class="panel voice-panel"><button class="text-button back-link" data-action="voice-back-case">← Case</button><p class="eyebrow">${this.state.voiceSimulation ? 'SIMULATED VOICE PREVIEW' : 'OWNER-STARTED VOICE'}</p><h1>Ready to record</h1><p class="lead">${this.state.voiceSimulation ? 'Preview only. No microphone or ASR will run.' : 'The G2 microphone stays off until you choose Start. Speak briefly, stop, then choose a reply or revision instruction on the glasses.'}</p>${button(startLabel, startAction, { primary: true, disabled: this.state.busy || (!this.state.voiceSimulation && !this.state.glassesAvailable) })}</section>`
   }
 
   private renderDraft(): string {
