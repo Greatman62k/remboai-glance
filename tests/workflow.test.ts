@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { AudioInputSource } from '@evenrealities/even_hub_sdk'
 import { DemoFixtures, FIXTURE_CASE_ID, FIXTURE_UNKNOWN_CASE_ID } from '../src/demo-fixtures.ts'
 import { parseEvenHubEvent } from '../src/evenhub-events.ts'
 import {
@@ -92,6 +93,14 @@ test('Even Hub envelope parser distinguishes click, scroll, double-click, and li
   assert.equal(foreground?.kind, 'foreground_exit')
   assert.equal(sdkEnvelope?.kind, 'scroll_down')
   assert.equal(parseEvenHubEvent({}), null)
+
+  const pcm = new Uint8Array([1, 2, 3, 4])
+  const audio = parseEvenHubEvent({ audioEvent: { audioPcm: pcm, source: AudioInputSource.Glasses } })
+  assert.equal(audio?.kind, 'audio')
+  if (audio?.kind === 'audio') {
+    assert.equal(audio.source, AudioInputSource.Glasses)
+    assert.equal(audio.pcm, pcm)
+  }
 })
 
 test('synthetic inbox and detail fixtures are clearly isolated and include look-ahead context', async () => {

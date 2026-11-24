@@ -10,15 +10,19 @@ import type {
   ResolveRequest,
   ResolveResult,
   SessionData,
+  TranscriptionData,
 } from './types.ts'
 
 export type FetchLike = typeof fetch
 
 export interface RequestOptions {
   body?: unknown
+  rawBody?: BodyInit
+  contentType?: string
   idempotencyKey?: string
   signal?: AbortSignal
   timeoutMs?: number
+  timeoutCode?: string
   authenticated?: boolean
 }
 
@@ -33,6 +37,7 @@ export interface GlanceApi {
   approveReply(caseId: string, expectedVersion: number, draftId: string, text: string, key: string, signal?: AbortSignal): Promise<ReplyResult>
   getReply(replyId: string, signal?: AbortSignal): Promise<ReplyData>
   resolveCase(caseId: string, body: ResolveRequest, signal?: AbortSignal): Promise<ResolveResult>
+  transcribeAudio(pcm: Uint8Array, signal?: AbortSignal): Promise<TranscriptionData>
 }
 
 const ERROR_COPY: Record<string, string> = {
@@ -64,6 +69,20 @@ const ERROR_COPY: Record<string, string> = {
   not_found: 'This Glance route is currently unavailable.',
   draft_unavailable: 'Draft generation is temporarily unavailable. Your current draft is still available.',
   reply_unavailable: 'The reply was not confirmed. Check the case status before retrying.',
+  invalid_content_type: 'The audio format was not accepted. Record a new voice note and try again.',
+  empty_audio: 'No audio was captured. Start recording and speak briefly before stopping.',
+  invalid_audio: 'The audio could not be read. Record again from the G2 microphone.',
+  audio_too_large: 'The recording is longer than the 40-second limit. Record a shorter message.',
+  transcription_disabled: 'Voice transcription is currently unavailable for this salon.',
+  transcription_unavailable: 'Voice transcription is temporarily unavailable. You can try a new recording later.',
+  transcription_timeout: 'Transcription took too long. The audio was cleared; record again when ready.',
+  empty_transcript: 'No speech was recognized. Try recording again in a quieter place.',
+  network_error: 'Network unavailable. Your current view may be stale.',
+  request_timeout: 'The request timed out. Check server state before repeating an action.',
+  request_cancelled: 'The request was cancelled.',
+  invalid_response: 'The server returned an unreadable response.',
+  microphone_unavailable: 'The G2 microphone could not start. Check microphone permission and glasses connection.',
+  audio_stream_interrupted: 'The G2 audio stream stopped unexpectedly. Record the message again.',
 }
 
 export class ApiError extends Error {
@@ -200,6 +219,35 @@ export class GlanceApiClient {
     })
   }
 
+  async transcribeAudio(pcm: Uint8Array, signal?: AbortSignal): Promise<TranscriptionData> {
+    if (pcm.byteLength === 0) throw new ApiError('empty_audio', 400, userMessageForError('empty_audio'))
+    if (pcm.byteLength % 2 !== 0) throw new ApiError('invalid_audio', 422, userMessageForError('invalid_audio'))
+    if (pcm.byteLength > 1_280_000) throw new ApiError('audio_too_large', 413, userMessageForError('audio_too_large'))
+    const uploadCopy = new Uint8Array(pcm.byteLength)
+    uploadCopy.set(pcm)
+    let result: unknown
+    try {
+      result = await this.request<unknown>('POST', '/transcriptions', {
+        rawBody: uploadCopy.buffer as ArrayBuffer,
+        contentType: 'application/octet-stream',
+        timeoutMs: 20_000,
+        timeoutCode: 'transcription_timeout',
+        signal,
+      })
+    } finally {
+      uploadCopy.fill(0)
+    }
+    if (!result || typeof result !== 'object') {
+      throw new ApiError('invalid_response', 200, 'The server returned an unreadable response.')
+    }
+    const value = result as Partial<TranscriptionData>
+    if (typeof value.transcript !== 'string' || value.transcript.length === 0 || value.transcript.length > 500 ||
+        typeof value.duration_ms !== 'number' || !Number.isFinite(value.duration_ms) || value.duration_ms < 0) {
+      throw new ApiError('invalid_response', 200, 'The server returned an unreadable response.')
+    }
+    return { transcript: value.transcript, duration_ms: value.duration_ms }
+  }
+
   private async request<T>(method: string, path: string, options: RequestOptions = {}): Promise<T> {
     const authenticated = options.authenticated !== false
     const session = authenticated ? this.sessions.load() : null
@@ -209,6 +257,7 @@ export class GlanceApiClient {
 
     const headers = new Headers({ Accept: 'application/json' })
     if (options.body !== undefined) headers.set('Content-Type', 'application/json')
+    if (options.rawBody !== undefined && options.contentType) headers.set('Content-Type', options.contentType)
     if (options.idempotencyKey) headers.set('Idempotency-Key', options.idempotencyKey)
     if (session) headers.set('Authorization', `Bearer ${session.access_token}`)
 
@@ -228,14 +277,15 @@ export class GlanceApiClient {
       response = await this.fetcher(`${this.baseUrl.replace(/\/+$/, '')}${path}`, {
         method,
         headers,
-        body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        body: options.rawBody ?? (options.body === undefined ? undefined : JSON.stringify(options.body)),
         signal: controller.signal,
         cache: 'no-store',
         credentials: 'omit',
       })
     } catch {
       if (timedOut) {
-        throw new ApiError('request_timeout', 0, 'The request timed out. Check server state before repeating an action.', null, null, true)
+        const code = options.timeoutCode ?? 'request_timeout'
+        throw new ApiError(code, 0, userMessageForError(code), null, null, true)
       }
       if (options.signal?.aborted) {
         throw new ApiError('request_cancelled', 0, 'The request was cancelled.')

@@ -1,4 +1,5 @@
 import {
+  AudioInputSource,
   CreateStartUpPageContainer,
   StartUpPageCreateResult,
   TextContainerProperty,
@@ -40,6 +41,9 @@ async function connectGlasses(): Promise<void> {
       app.setGlassesAvailable(false)
       return
     }
+    app.setAudioControl((open, source) => open
+      ? bridge.audioControl(true, source ?? AudioInputSource.Glasses)
+      : bridge.audioControl(false))
     app.setGlassesAvailable(true)
     app.setGlassesWriter((content) => {
       void bridge.textContainerUpgrade(new TextContainerUpgrade({
@@ -60,7 +64,10 @@ async function connectGlasses(): Promise<void> {
       const parsed = parseEvenHubEvent(event)
       if (parsed) void app.handleGlassesInput(parsed)
     })
-    window.addEventListener('pagehide', unsubscribe, { once: true })
+    window.addEventListener('pagehide', () => {
+      unsubscribe()
+      void app.dispose()
+    }, { once: true })
   } catch (error) {
     const detail = error instanceof Error ? error.name : 'bridge error'
     app.setGlassesStatus(`Even Hub display unavailable (${detail}).`)

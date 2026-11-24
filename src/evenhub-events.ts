@@ -1,4 +1,5 @@
 import {
+  AudioInputSource,
   evenHubEventFromJson,
   EventSourceType,
   OsEventTypeList,
@@ -9,7 +10,7 @@ export type GlanceInput =
   | { kind: 'click' | 'double_click' | 'scroll_up' | 'scroll_down'; source: EventSourceType | null }
   | { kind: 'foreground_enter' | 'foreground_exit' | 'system_exit' | 'abnormal_exit'; source: null }
   | { kind: 'menu'; itemId: number | null; source: null }
-  | { kind: 'audio'; source: null }
+  | { kind: 'audio'; source: AudioInputSource | null; pcm: Uint8Array | null }
 
 export function parseEvenHubEvent(input: unknown): GlanceInput | null {
   let envelope: EvenHubEvent
@@ -26,7 +27,11 @@ export function parseEvenHubEvent(input: unknown): GlanceInput | null {
   if (envelope.menuItemClickEvent) {
     return { kind: 'menu', itemId: envelope.menuItemClickEvent.itemID ?? null, source: null }
   }
-  if (envelope.audioEvent) return { kind: 'audio', source: null }
+  if (envelope.audioEvent) return {
+    kind: 'audio',
+    source: envelope.audioEvent.source ?? null,
+    pcm: envelope.audioEvent.audioPcm instanceof Uint8Array ? envelope.audioEvent.audioPcm : null,
+  }
 
   const candidates = [envelope.sysEvent, envelope.textEvent, envelope.listEvent]
   for (const candidate of candidates) {

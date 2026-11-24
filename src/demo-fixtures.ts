@@ -9,6 +9,7 @@ import type {
   ResolveRequest,
   ResolveResult,
   SessionData,
+  TranscriptionData,
 } from './types.ts'
 import { presentReplyState } from './workflow.ts'
 
@@ -171,6 +172,10 @@ export class DemoFixtures {
     const item = this.cases.get(caseId)
     if (!item) throw new ApiError('case_not_found', 404, 'Synthetic case not found.')
     return { ...item, context: [...item.context], latest_reply: item.latest_reply ? { ...item.latest_reply } : null }
+  }
+
+  async transcribeAudio(_pcm: Uint8Array): Promise<TranscriptionData> {
+    throw new ApiError('transcription_disabled', 503, 'Live transcription is disabled in development fixtures.')
   }
 
   async createDraft(caseId: string, expectedVersion: number, key: string): Promise<DraftData> {

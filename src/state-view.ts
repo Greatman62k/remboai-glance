@@ -1,6 +1,6 @@
 import type { CaseData, DraftData, InboxData, ReplyData, ResolveReason } from './types.ts'
 
-export type GlanceScreen = 'pair' | 'inbox' | 'case' | 'draft' | 'approval' | 'status' | 'resolve'
+export type GlanceScreen = 'pair' | 'inbox' | 'case' | 'voice' | 'draft' | 'approval' | 'status' | 'resolve'
 export type ConnectionState = 'loading' | 'connected' | 'reconnecting' | 'offline' | 'error' | 'development-fixtures'
 
 export interface AppStateView {

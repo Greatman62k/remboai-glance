@@ -50,11 +50,13 @@ The simulator exposes a 576 × 288 G2 display. The SDK text container is positio
 ## Architecture
 
 - `src/main.ts` waits for the Even Hub bridge, creates the text container and forwards SDK events.
-- `src/app.ts` coordinates pairing, inbox, case, draft, approval, reply-status and resolution screens.
-- `src/client.ts` implements the typed `/api/v1/glance` requests, bearer handling, timeouts, request IDs, `Retry-After`, and no-store fetches.
+- `src/app.ts` coordinates pairing, inbox, case, voice, draft, approval, reply-status and resolution screens.
+- `src/client.ts` implements the typed `/api/v1/glance` requests, including authenticated raw PCM transcription, bearer handling, timeouts, request IDs, `Retry-After`, and no-store fetches.
 - `src/session.ts` validates pairing codes and stores the revocable session token in browser `localStorage` until expiry or revocation.
 - `src/workflow.ts` contains presentation helpers and payload-bound pending idempotency keys. Pending actions are tab-scoped so an uncertain retry can reuse its key after a WebView reload; successful actions clear their record.
-- `src/evenhub-events.ts` parses SDK event envelopes, including ring and display lifecycle events.
+- `src/evenhub-events.ts` parses SDK event envelopes, including source-tagged audio and ring/display lifecycle events.
+- `src/audio-capture.ts` captures only owner-started G2 microphone PCM in bounded memory, with 40-second and 1,280,000-byte limits.
+- `src/voice-intents.ts` keeps the explicit Use as reply and Use as instruction paths separate; both continue into persisted draft review and neither can approve a reply.
 - `src/demo-fixtures.ts` contains synthetic-only records for offline simulator walkthroughs.
 
 The API client calls:
@@ -64,8 +66,19 @@ The API client calls:
 - `POST /cases/{case_id}/drafts`, `/drafts/manual`, and `/drafts/{draft_id}/revise`
 - `POST /cases/{case_id}/replies` and `GET /replies/{reply_id}`
 - `POST /cases/{case_id}/resolve`
+- `POST /transcriptions` with raw `application/octet-stream` mono 16 kHz signed 16-bit little-endian PCM; the client validates `{ data: { transcript, duration_ms }}`.
 
 The paired session determines salon and owner authority. The client does not submit salon, customer, recipient, or channel IDs as authority. Reply approval queues exact text; Telegram acceptance is not shown as delivery confirmation. Resolution does not change payment state.
+
+## Voice input
+
+Voice capture starts only after the owner selects Record from an open case. The app waits for successful startup-page creation before exposing `bridge.audioControl`, opens `AudioInputSource.Glasses`, accepts only glasses-source PCM events, and closes the microphone on stop, cancellation, app backgrounding, errors, navigation, session loss, and page exit. It does not fall back to the phone microphone.
+
+The app copies PCM event chunks into a bounded in-memory buffer and submits them directly to the authenticated transcription endpoint. Captured audio is cleared after upload, failure, cancellation, or navigation. Transcripts are held only in the active app state and are not written to local/session storage, IndexedDB, logs, or analytics. Voice-derived retry keys are memory-only so their payloads cannot persist speech text.
+
+After transcription, the owner must explicitly choose **Use as reply** or **Use as instruction** on the phone. The first creates a persisted manual draft. The second revises only a current, unexpired, unedited AI draft and is unavailable otherwise. Both paths lead to the existing full-text editor; the owner must inspect and approve the exact outgoing message separately. A transcript never sends or resolves anything.
+
+The manifest declares the `g2-microphone` permission. The installed SDK is `@evenrealities/even_hub_sdk` 0.0.16. The simulator package is 0.9.5 and documents 100 ms audio-event frames. The local simulator environment exposes audio inputs including a zero-sample `alsa:null` device; automated capture tests inject controlled PCM events instead of treating simulator audio as captured speech. These checks do not establish physical G2 microphone, live ASR-provider, packaged WebView, staging, or Telegram delivery acceptance.
 
 ## Security and current limitations
 
@@ -73,7 +86,7 @@ The paired session determines salon and owner authority. The client does not sub
 - Authenticated requests omit cookies, use bearer authorization, and set `cache: no-store`. Response data is held in app memory rather than persisted as authoritative case state.
 - AI generation, revision and reply submission require an available backend. Synthetic fixtures are not live responses.
 - No staging hostname or packaged WebView origin has been confirmed. Real HTTPS requests, packaged-app CORS, and production routing have not been verified from the Even Hub WebView.
-- Microphone capture and ASR are not implemented in this frontend milestone.
+- Physical G2 microphone permission and capture, real ASR provider success, packaged WebView CORS, and real HTTPS staging integration remain unverified.
 
 ## Repository history
 

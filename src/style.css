@@ -197,6 +197,19 @@ small { color: var(--muted); font-size: 11px; line-height: 1.5; }
 .draft-meta span { padding: 6px 9px; color: #58685f; background: #f0f4f0; border-radius: 99px; font-size: 10px; }
 .revision-form { margin-top: 19px; padding-top: 18px; border-top: 1px solid var(--line); }
 .revision-form .button { align-self: flex-start; }
+.recording-indicator { display: flex; align-items: center; gap: 10px; margin: 12px 0 18px; padding: 13px 15px; color: #7d302d; background: var(--red-soft); border: 1px solid #f1c8bb; border-radius: 11px; }
+.recording-dot { width: 11px; height: 11px; flex: 0 0 11px; background: #bd3b36; border-radius: 50%; box-shadow: 0 0 0 5px rgba(189,59,54,.12); animation: record-pulse 1.25s ease-in-out infinite; }
+.voice-duration { margin-left: auto; color: #572622; font: 700 17px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.voice-facts { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 16px; }
+.voice-facts span { padding: 6px 9px; color: #58685f; background: #f0f4f0; border-radius: 99px; font-size: 10px; }
+.transcript-text { min-height: 110px; margin: 7px 0 14px; color: #28352f; background: #f8f9f6; white-space: pre-wrap; }
+.intent-cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin: 12px 0 16px; }
+.intent-cards > div { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; padding: 14px; background: #f8f9f6; border: 1px solid var(--line); border-radius: 11px; }
+.intent-cards h2 { margin: 0; font-size: 16px; }
+.intent-cards p { flex: 1; margin: 0; color: var(--muted); font-size: 11px; line-height: 1.55; }
+.intent-cards .button { margin-top: 4px; }
+.voice-panel > .warning-card { margin: 14px 0; }
+@keyframes record-pulse { 50% { box-shadow: 0 0 0 8px rgba(189,59,54,.04); opacity: .75; } }
 .check-row { display: flex; align-items: flex-start; gap: 10px; margin-top: 14px; color: #35423c; font-size: 12px; line-height: 1.5; cursor: pointer; }
 .check-row input { width: 17px; height: 17px; flex: 0 0 17px; margin: 1px 0 0; accent-color: var(--pine); }
 .approval-panel #approval-editor { margin: 7px 0 0; }
@@ -252,5 +265,6 @@ small { color: var(--muted); font-size: 11px; line-height: 1.5; }
   .button { padding-inline: 10px; }
   .latest-reply { grid-template-columns: 1fr auto; }
   .latest-reply .eyebrow { grid-column: 1 / -1; }
+  .intent-cards { grid-template-columns: 1fr; }
   .app-footer { width: calc(100% - 24px); }
 }

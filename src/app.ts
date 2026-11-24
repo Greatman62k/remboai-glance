@@ -3,7 +3,9 @@ import { GlanceApiClient, ApiError, userMessageForError, type GlanceApi } from '
 import { DEMO_FIXTURES_ENABLED } from './config.ts'
 import { DemoFixtures } from './demo-fixtures.ts'
 import { RING_EVENT_SOURCE, type GlanceInput } from './evenhub-events.ts'
+import { AudioCaptureError, G2PcmCapture, type AudioInputControl, type CaptureStopReason, type CaptureStopRequest } from './audio-capture.ts'
 import { DEVICE_LABEL, SessionStore, isValidPairingCode, normalizePairingCode } from './session.ts'
+import { canUseTranscriptAsInstruction, useTranscriptAsInstruction, useTranscriptAsReply } from './voice-intents.ts'
 import type {
   CaseData,
   DraftData,
@@ -34,6 +36,11 @@ interface AppState extends AppStateView {
   reviewedExactText: boolean
   glassesAvailable: boolean
   glassesStatus: string
+  voicePhase: 'idle' | 'starting' | 'recording' | 'stopping' | 'transcribing' | 'transcript_ready' | 'error'
+  voiceDurationMs: number
+  voiceTranscriptionDurationMs: number | null
+  voiceTranscript: string
+  voiceError: string
 }
 
 const REASONS: Array<{ value: ResolveReason; label: string }> = [
@@ -78,6 +85,11 @@ const EMPTY_STATE: AppState = {
   autoPolls: 0,
   glassesAvailable: false,
   glassesStatus: 'Connecting to the Even Hub bridge…',
+  voicePhase: 'idle',
+  voiceDurationMs: 0,
+  voiceTranscriptionDurationMs: null,
+  voiceTranscript: '',
+  voiceError: '',
 }
 
 function escapeHtml(value: unknown): string {
@@ -112,12 +124,24 @@ export class GlanceAppController {
   readonly fixtures = new DemoFixtures()
   private api: GlanceApi
   private readonly keys = new IdempotencyKeyBook()
+  // Voice payloads must never be written to sessionStorage with a retry key.
+  private readonly voiceKeys = new IdempotencyKeyBook(null)
+  private readonly voiceCapture = new G2PcmCapture()
   private readonly root: HTMLElement
   private glassesWriter: ((text: string) => void) | null = null
+  private audioControl: AudioInputControl | null = null
   private replyTimer: number | null = null
+  private pollTimer: number | null = null
   private foreground = true
   private pollController: AbortController | null = null
+  private transcriptionController: AbortController | null = null
+  private uploadingPcm: Uint8Array | null = null
+  private voiceGeneration = 0
+  private voiceFinish: Promise<void> | null = null
+  private voiceDerivedDraftIds = new Set<string>()
   private lastRenderedGlasses = ''
+  private renderedScreen: GlanceScreen | null = null
+  private readonly visibilityHandler = () => void this.onVisibilityChange()
 
   constructor(root: HTMLElement, apiBase: string) {
     this.root = root
@@ -131,8 +155,8 @@ export class GlanceAppController {
     this.root.addEventListener('input', (event) => this.handleInput(event))
     this.root.addEventListener('change', (event) => this.handleChange(event))
     this.root.addEventListener('submit', (event) => void this.handleSubmit(event))
-    document.addEventListener('visibilitychange', () => void this.onVisibilityChange())
-    window.setInterval(() => void this.pollVisibleState(), 5_000)
+    document.addEventListener('visibilitychange', this.visibilityHandler)
+    this.pollTimer = window.setInterval(() => void this.pollVisibleState(), 5_000)
 
     const session = this.sessions.load()
     if (!session) {
@@ -155,7 +179,28 @@ export class GlanceAppController {
   setGlassesAvailable(available: boolean): void {
     if (this.state.glassesAvailable === available) return
     this.state.glassesAvailable = available
+    if (!available && ['starting', 'recording'].includes(this.voiceCapture.phase)) {
+      void this.stopForGlassesDisconnect()
+    }
     this.render()
+  }
+
+  setAudioControl(control: AudioInputControl): void {
+    this.audioControl = control
+  }
+
+  async dispose(): Promise<void> {
+    document.removeEventListener('visibilitychange', this.visibilityHandler)
+    if (this.pollTimer !== null) window.clearInterval(this.pollTimer)
+    this.pollTimer = null
+    this.pollController?.abort()
+    this.transcriptionController?.abort()
+    await this.clearVoiceWorkflow('')
+    this.keys.clear()
+    this.voiceKeys.clear()
+    this.voiceDerivedDraftIds.clear()
+    this.glassesWriter = null
+    this.audioControl = null
   }
 
   setGlassesStatus(status: string): void {
@@ -168,10 +213,299 @@ export class GlanceAppController {
     return this.lastRenderedGlasses
   }
 
+  private async beginVoiceCapture(): Promise<void> {
+    const item = this.state.caseData
+    if (this.state.busy || this.state.voicePhase === 'starting' || this.state.voicePhase === 'recording' ||
+        this.state.voicePhase === 'stopping' || this.state.voicePhase === 'transcribing') return
+    if (!item || item.status !== 'open' || this.state.screen !== 'case' && this.state.screen !== 'voice') return
+    if (this.state.fixtureMode || !this.state.sessionPresent || !this.sessions.load()) {
+      this.failLocal('Pair this device with a live owner session before using voice transcription.', 'session_expired')
+      return
+    }
+    if (!this.state.glassesAvailable || !this.audioControl) {
+      this.failLocal('The G2 microphone is unavailable until the Even Hub startup page is ready and glasses are connected.', 'microphone_unavailable')
+      return
+    }
+    if (!this.foreground || document.visibilityState === 'hidden') {
+      this.failLocal('Bring Glance to the foreground before recording.', 'microphone_unavailable')
+      return
+    }
+
+    const generation = ++this.voiceGeneration
+    this.state.focusedAction = 0
+    this.clearError()
+    this.state.voicePhase = 'starting'
+    this.state.voiceDurationMs = 0
+    this.state.voiceTranscriptionDurationMs = null
+    this.state.voiceTranscript = ''
+    this.state.voiceError = ''
+    this.state.message = 'Starting the G2 microphone…'
+    this.state.screen = 'voice'
+    this.render()
+    try {
+      const opened = await this.voiceCapture.start(
+        this.audioControl,
+        (reason) => this.onCaptureStopRequested(reason),
+        () => {
+          this.state.voiceDurationMs = this.voiceCapture.durationMs
+          const duration = this.root.querySelector<HTMLElement>('.voice-duration')
+          if (duration) duration.textContent = this.formatDuration(this.state.voiceDurationMs)
+          this.updateGlasses()
+        },
+      )
+      if (generation !== this.voiceGeneration) return
+      if (!opened) {
+        this.state.voicePhase = 'error'
+        this.state.voiceError = userMessageForError('microphone_unavailable')
+        this.state.message = ''
+      } else {
+        this.state.voicePhase = 'recording'
+        this.state.voiceError = ''
+        this.state.message = 'Microphone active. Speak briefly, then stop to transcribe.'
+      }
+    } catch (error) {
+      if (generation !== this.voiceGeneration) return
+      const closed = await this.voiceCapture.cancel()
+      if (!closed) {
+        this.markMicrophoneShutdownUnconfirmed()
+        this.render()
+        return
+      }
+      this.state.voicePhase = 'error'
+      this.state.voiceError = userMessageForError('microphone_unavailable')
+      this.state.message = ''
+    }
+    this.render()
+  }
+
+  private onCaptureStopRequested(reason: CaptureStopRequest): void {
+    if (reason === 'stream_interrupted' || reason === 'invalid_audio') {
+      void this.stopInvalidCapture(reason)
+      return
+    }
+    void this.stopAndTranscribe(reason)
+  }
+
+  private async stopInvalidCapture(reason: 'stream_interrupted' | 'invalid_audio'): Promise<void> {
+    if (this.voiceFinish) return this.voiceFinish
+    const generation = this.voiceGeneration
+    this.state.voicePhase = 'stopping'
+    this.state.voiceError = ''
+    this.state.message = ''
+    this.render()
+    const work = (async () => {
+      const closed = await this.voiceCapture.cancel()
+      if (generation !== this.voiceGeneration) return
+      if (!closed) {
+        this.markMicrophoneShutdownUnconfirmed()
+        this.render()
+        return
+      }
+      this.state.voicePhase = 'error'
+      this.state.voiceError = reason === 'invalid_audio'
+        ? userMessageForError('invalid_audio')
+        : userMessageForError('audio_stream_interrupted')
+      this.state.voiceDurationMs = 0
+      this.state.message = ''
+      this.render()
+    })()
+    this.voiceFinish = work
+    try { await work } finally { if (this.voiceFinish === work) this.voiceFinish = null }
+  }
+
+  private async stopAndTranscribe(reason: CaptureStopReason): Promise<void> {
+    if (this.voiceFinish) return this.voiceFinish
+    if (this.voiceCapture.phase !== 'recording') return
+    const generation = this.voiceGeneration
+    this.state.voicePhase = 'stopping'
+    this.state.message = 'Stopping the G2 microphone…'
+    this.render()
+    const work = (async () => {
+      let captured: Awaited<ReturnType<G2PcmCapture['stop']>> = null
+      let controller: AbortController | null = null
+      let shutdownUnconfirmed = false
+      let microphoneStopFailed = false
+      try {
+        captured = await this.voiceCapture.stop(reason)
+        if (!captured || generation !== this.voiceGeneration) return
+        this.state.voiceDurationMs = captured.durationMs
+        if (!captured.pcm.byteLength) {
+          this.state.voicePhase = 'error'
+          this.state.voiceError = userMessageForError('empty_audio')
+          this.state.message = ''
+          return
+        }
+        this.state.voicePhase = 'transcribing'
+        this.state.message = 'Transcribing in memory. The audio is not saved.'
+        this.render()
+        controller = new AbortController()
+        this.transcriptionController = controller
+        this.uploadingPcm = captured.pcm
+        const result = await this.api.transcribeAudio(captured.pcm, controller.signal)
+        if (generation !== this.voiceGeneration) return
+        this.state.voiceTranscript = result.transcript
+        this.state.voiceTranscriptionDurationMs = result.duration_ms
+        this.state.voicePhase = 'transcript_ready'
+        this.state.voiceError = ''
+        this.state.message = 'Transcript ready for your choice. Nothing has been sent.'
+      } catch (error) {
+        if (generation !== this.voiceGeneration) return
+        if (error instanceof AudioCaptureError && error.code === 'microphone_stop_failed') {
+          const closed = await this.voiceCapture.cancel()
+          if (!closed) {
+            this.markMicrophoneShutdownUnconfirmed()
+            shutdownUnconfirmed = true
+          } else microphoneStopFailed = true
+        }
+        if (this.handleLostSession(error)) return
+        this.state.voiceTranscript = ''
+        this.state.voiceTranscriptionDurationMs = null
+        this.state.voicePhase = 'error'
+        this.state.voiceError = shutdownUnconfirmed
+          ? 'Even Hub did not confirm microphone shutdown. Keep Glance open and reconnect the glasses before recording again.'
+          : microphoneStopFailed
+          ? 'The G2 microphone did not stop on the first attempt. Audio was cleared and not sent. The microphone is now closed; reconnect the glasses if the issue repeats.'
+          : error instanceof ApiError
+          ? userMessageForError(error.code)
+          : 'Transcription could not be completed. The recording was cleared; start a new recording if you want to try again.'
+        this.state.errorCode = error instanceof ApiError ? error.code : null
+        this.state.requestId = error instanceof ApiError ? error.requestId : null
+        this.state.retryAfter = error instanceof ApiError ? error.retryAfterSeconds : null
+        if (error instanceof ApiError && ['network_error', 'request_timeout', 'transcription_timeout'].includes(error.code)) {
+          this.state.connection = 'offline'
+        }
+        this.state.message = ''
+      } finally {
+        captured?.pcm.fill(0)
+        if (this.uploadingPcm === captured?.pcm) this.uploadingPcm = null
+        if (controller && this.transcriptionController === controller) this.transcriptionController = null
+        if (generation === this.voiceGeneration) this.render()
+      }
+    })()
+    this.voiceFinish = work
+    try { await work } finally { if (this.voiceFinish === work) this.voiceFinish = null }
+  }
+
+  private async useVoiceTranscriptAsReply(): Promise<void> {
+    const current = this.state.caseData
+    if (!current || this.state.voicePhase !== 'transcript_ready' || !this.state.voiceTranscript || this.state.busy) return
+    const transcript = this.state.voiceTranscript
+    try { normalizeOwnerText(transcript, 700) } catch (error) {
+      this.failLocal(error instanceof Error ? error.message : 'The transcript cannot be used as a reply.', 'invalid_text')
+      return
+    }
+    const fresh = await this.refreshCase()
+    if (!fresh || fresh.status !== 'open' || fresh.version !== current.version) {
+      this.state.stale = true
+      this.state.message = 'The case changed. Refresh its context before using this transcript.'
+      this.render()
+      return
+    }
+    const scope = `voice-manual:${fresh.case_id}`
+    let key: string
+    try { key = this.voiceKeys.acquire(scope, { expected_version: fresh.version, text: transcript }) } catch (error) {
+      this.failLocal(error instanceof Error ? error.message : 'Retry the same voice action.', 'uncertain_action')
+      return
+    }
+    await this.withBusy('voice-manual-draft', async () => {
+      const draft = await useTranscriptAsReply(this.api, fresh.case_id, fresh.version, transcript, key)
+      this.voiceKeys.complete(scope)
+      this.voiceDerivedDraftIds.add(draft.draft_id)
+      this.acceptDraft(draft, true)
+      this.state.message = 'Owner-authored draft saved from your transcript. Review and approve the exact text on the phone.'
+    }, { keepKeyOnFailure: true, keyScope: scope, keyBook: this.voiceKeys })
+  }
+
+  private async useVoiceTranscriptAsInstruction(): Promise<void> {
+    const current = this.state.caseData
+    const draft = this.state.draft
+    const transcript = this.state.voiceTranscript
+    if (!canUseTranscriptAsInstruction(current, draft, this.state.stale, this.state.editorText, transcript)) {
+      this.failLocal('Use as instruction requires an unexpired, current AI draft with no unsaved edits and a transcript of 300 characters or fewer.', 'draft_unavailable')
+      return
+    }
+    if (!current || !draft || this.state.busy) return
+    const fresh = await this.refreshCase()
+    if (!fresh || !canUseTranscriptAsInstruction(fresh, draft, this.state.stale, this.state.editorText, transcript)) {
+      this.state.stale = true
+      this.state.message = 'Refresh the case or create a current AI suggestion before using a voice instruction.'
+      this.render()
+      return
+    }
+    const scope = `voice-revise:${fresh.case_id}:${draft.draft_id}`
+    let key: string
+    try { key = this.voiceKeys.acquire(scope, { expected_version: fresh.version, instruction: transcript }) } catch (error) {
+      this.failLocal(error instanceof Error ? error.message : 'Retry the same voice action.', 'uncertain_action')
+      return
+    }
+    await this.withBusy('voice-revise', async () => {
+      const next = await useTranscriptAsInstruction(this.api, fresh.case_id, draft.draft_id, fresh.version, transcript, key)
+      this.voiceKeys.complete(scope)
+      this.voiceDerivedDraftIds.add(next.draft_id)
+      this.acceptDraft(next, false)
+      this.state.message = 'Revised AI draft saved. Review and edit the exact customer text on the phone.'
+    }, { keepKeyOnFailure: true, keyScope: scope, keyBook: this.voiceKeys })
+  }
+
+  private formatDuration(milliseconds: number): string {
+    const seconds = Math.floor(milliseconds / 1000)
+    return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`
+  }
+
+  private async stopForBackground(): Promise<void> {
+    if (this.state.screen !== 'voice' && this.voiceCapture.phase === 'idle' && !this.transcriptionController) return
+    await this.clearVoiceWorkflow('Voice activity stopped because Glance moved to the background. Audio and transcript were cleared.')
+    this.state.voicePhase = 'error'
+    if (this.state.glassesAvailable) {
+      this.state.voiceError = 'Recording stopped in the background. Return to the case and start again when ready.'
+    }
+    this.render()
+  }
+
+  private async stopForGlassesDisconnect(): Promise<void> {
+    const closed = await this.clearVoiceWorkflow('')
+    this.state.voicePhase = 'error'
+    if (closed) {
+      this.state.voiceError = 'The Even Hub connection was lost. Recording and transcript were cleared. Reconnect the glasses before recording again.'
+    }
+    this.state.message = ''
+    this.render()
+  }
+
+  private async clearVoiceWorkflow(message: string): Promise<boolean> {
+    ++this.voiceGeneration
+    this.transcriptionController?.abort()
+    this.transcriptionController = null
+    this.uploadingPcm?.fill(0)
+    this.uploadingPcm = null
+    this.voiceFinish = null
+    this.voiceKeys.clear()
+    this.state.voicePhase = 'idle'
+    this.state.voiceDurationMs = 0
+    this.state.voiceTranscriptionDurationMs = null
+    this.state.voiceTranscript = ''
+    this.state.voiceError = ''
+    if (message) this.state.message = message
+    const closed = await this.voiceCapture.cancel()
+    if (!closed) {
+      this.markMicrophoneShutdownUnconfirmed()
+      this.render()
+    }
+    return closed
+  }
+
+  private markMicrophoneShutdownUnconfirmed(): void {
+    this.state.glassesAvailable = false
+    this.state.glassesStatus = 'G2 microphone shutdown was not confirmed. Keep Glance open and reconnect the glasses before recording again.'
+    this.state.voicePhase = 'error'
+    this.state.voiceError = 'Even Hub did not confirm microphone shutdown. Keep Glance open and reconnect the glasses before recording again.'
+  }
+
   async handleGlassesInput(input: GlanceInput): Promise<void> {
     if (input.kind === 'foreground_exit') {
       this.foreground = false
       this.clearReplyTimer()
+      await this.stopForBackground()
       return
     }
     if (input.kind === 'foreground_enter') {
@@ -179,9 +513,21 @@ export class GlanceAppController {
       await this.onForegroundResume()
       return
     }
-    if (input.kind === 'system_exit' || input.kind === 'abnormal_exit' || input.kind === 'audio') return
+    if (input.kind === 'audio') {
+      if (this.foreground && document.visibilityState !== 'hidden') {
+        const result = this.voiceCapture.receive(input.source, input.pcm)
+        if (!result.ignored && result.acceptedBytes === 0 && input.pcm?.byteLength) {
+          this.state.voiceError = 'The audio chunk was invalid. Recording stopped; please try again.'
+        }
+      }
+      return
+    }
+    if (input.kind === 'system_exit' || input.kind === 'abnormal_exit') {
+      await this.clearVoiceWorkflow('')
+      return
+    }
     if (input.kind === 'menu') {
-      // The system menu may temporarily move this app to the background. App data stays in memory.
+      await this.stopForBackground()
       return
     }
     if (input.source !== null && input.source !== RING_EVENT_SOURCE && input.source !== EventSourceType.TOUCH_EVENT_FROM_GLASSES_R) return
@@ -235,10 +581,26 @@ export class GlanceAppController {
       if (item) return this.openCase(item.case_id)
     }
     if (action === 'refresh-case') { await this.refreshCase(true); return }
+    if (action === 'start-voice') return this.beginVoiceCapture()
+    if (action === 'stop-voice') return this.stopAndTranscribe('owner')
+    if (action === 'cancel-voice') {
+      await this.clearVoiceWorkflow('Voice recording cancelled. Audio was cleared from memory.')
+      this.state.screen = 'case'
+      this.render()
+      return
+    }
+    if (action === 'use-transcript-reply') return this.useVoiceTranscriptAsReply()
+    if (action === 'use-transcript-instruction') return this.useVoiceTranscriptAsInstruction()
+    if (action === 'voice-back-case') {
+      await this.clearVoiceWorkflow('Voice transcript cleared.')
+      this.state.screen = 'case'
+      this.render()
+      return
+    }
     if (action === 'generate-draft') return this.generateDraft()
     if (action === 'write-manually') return this.beginManualDraft()
     if (action === 'save-manual') return this.createManualDraft()
-    if (action === 'save-owner-copy') return this.createManualDraft(this.state.editorText)
+    if (action === 'save-owner-copy') return this.createManualDraft(this.state.editorText, Boolean(this.state.draft && this.voiceDerivedDraftIds.has(this.state.draft.draft_id)))
     if (action === 'revise') return this.reviseDraft()
     if (action === 'open-approval') return this.openApproval()
     if (action === 'approve') return this.approveExactText()
@@ -470,6 +832,9 @@ export class GlanceAppController {
       const previousConnection = this.state.connection
       this.state.caseData = fresh
       this.state.replyId = fresh.latest_reply?.reply_id ?? this.state.replyId
+      if (this.state.draft && this.state.draft.based_on_version === fresh.version && Date.parse(this.state.draft.expires_at) > Date.now()) {
+        this.state.stale = false
+      }
       if (changed && this.state.draft && this.state.draft.based_on_version !== fresh.version) {
         this.state.stale = true
         this.state.message = 'The case changed. Context refreshed; create a new draft before approving.'
@@ -529,7 +894,7 @@ export class GlanceAppController {
     this.render()
   }
 
-  private async createManualDraft(textOverride?: string): Promise<void> {
+  private async createManualDraft(textOverride?: string, voiceDerived = false): Promise<void> {
     const current = this.state.caseData
     if (!current || current.status !== 'open') return
     let text: string
@@ -545,20 +910,22 @@ export class GlanceAppController {
       this.render()
       return
     }
-    const scope = `manual-draft:${fresh.case_id}`
+    const scope = voiceDerived ? `voice-manual:${fresh.case_id}` : `manual-draft:${fresh.case_id}`
+    const keyBook = voiceDerived ? this.voiceKeys : this.keys
     const payload = { expected_version: fresh.version, text }
     let key: string
     try {
-      key = this.keys.acquire(scope, payload)
+      key = keyBook.acquire(scope, payload)
     } catch (error) {
       this.failLocal(error instanceof Error ? error.message : 'Retry the original request first.', 'uncertain_action')
       return
     }
     await this.withBusy('manual-draft', async () => {
       const draft = await this.api.createManualDraft(fresh.case_id, fresh.version, text, key)
-      this.keys.complete(scope)
+      keyBook.complete(scope)
+      if (voiceDerived) this.voiceDerivedDraftIds.add(draft.draft_id)
       this.acceptDraft(draft, true)
-    }, { keepKeyOnFailure: true, keyScope: scope })
+    }, { keepKeyOnFailure: true, keyScope: scope, keyBook })
   }
 
   private async reviseDraft(): Promise<void> {
@@ -579,21 +946,24 @@ export class GlanceAppController {
       this.render()
       return
     }
-    const scope = `revise:${fresh.case_id}:${draft.draft_id}`
+    const voiceDerived = this.voiceDerivedDraftIds.has(draft.draft_id)
+    const scope = `${voiceDerived ? 'voice-revise' : 'revise'}:${fresh.case_id}:${draft.draft_id}`
+    const keyBook = voiceDerived ? this.voiceKeys : this.keys
     const payload = { expected_version: fresh.version, instruction }
     let key: string
     try {
-      key = this.keys.acquire(scope, payload)
+      key = keyBook.acquire(scope, payload)
     } catch (error) {
       this.failLocal(error instanceof Error ? error.message : 'Retry the original request first.', 'uncertain_action')
       return
     }
     await this.withBusy('revise', async () => {
       const next = await this.api.reviseDraft(fresh.case_id, draft.draft_id, fresh.version, instruction, key)
-      this.keys.complete(scope)
+      keyBook.complete(scope)
+      if (voiceDerived) this.voiceDerivedDraftIds.add(next.draft_id)
       this.acceptDraft(next, false)
       this.state.message = 'Revised draft persisted. The previous draft was replaced by the backend.'
-    }, { keepKeyOnFailure: true, keyScope: scope })
+    }, { keepKeyOnFailure: true, keyScope: scope, keyBook })
   }
 
   private acceptDraft(draft: DraftData, manual: boolean): void {
@@ -657,18 +1027,20 @@ export class GlanceAppController {
       this.render()
       return
     }
+    const voiceDerived = this.voiceDerivedDraftIds.has(draft.draft_id)
     const scope = `approve:${fresh.case_id}`
+    const keyBook = voiceDerived ? this.voiceKeys : this.keys
     const payload = { expected_version: fresh.version, draft_id: draft.draft_id, text }
     let key: string
     try {
-      key = this.keys.acquire(scope, payload)
+      key = keyBook.acquire(scope, payload)
     } catch (error) {
       this.failLocal(error instanceof Error ? error.message : 'Retry the original approval text.', 'uncertain_action')
       return
     }
     await this.withBusy('approve', async () => {
       const result = await this.api.approveReply(fresh.case_id, fresh.version, draft.draft_id, text, key)
-      this.keys.complete(scope)
+      keyBook.complete(scope)
       this.state.replyId = result.reply_id
       this.state.reply = {
         reply_id: result.reply_id,
@@ -696,7 +1068,7 @@ export class GlanceAppController {
       this.state.message = 'Reply queued. It has not been confirmed delivered.'
       await this.refreshCase()
       await this.fetchReply(result.reply_id, true)
-    }, { keepKeyOnFailure: true, keyScope: scope })
+    }, { keepKeyOnFailure: true, keyScope: scope, keyBook })
   }
 
   private async recoverReply(): Promise<void> {
@@ -821,8 +1193,11 @@ export class GlanceAppController {
     }
     if (!this.sessions.load()) return
     await this.withBusy('revoke-session', async () => {
+      await this.clearVoiceWorkflow('')
       await this.liveApi.revokeCurrentSession()
       this.keys.clear()
+      this.voiceKeys.clear()
+      this.voiceDerivedDraftIds.clear()
       this.state.sessionPresent = false
       this.state.screen = 'pair'
       this.state.salonName = ''
@@ -836,8 +1211,14 @@ export class GlanceAppController {
   }
 
   private async retryUncertainAction(): Promise<void> {
+    if (this.state.screen === 'voice' && this.state.caseData) {
+      const caseId = this.state.caseData.case_id
+      if (this.voiceKeys.has(`voice-manual:${caseId}`)) return this.useVoiceTranscriptAsReply()
+      const draftId = this.state.draft?.draft_id
+      if (draftId && this.voiceKeys.has(`voice-revise:${caseId}:${draftId}`)) return this.useVoiceTranscriptAsInstruction()
+    }
     if (this.state.screen === 'approval') return this.approveExactText()
-    if (this.state.screen === 'draft' && this.state.manualMode) return this.createManualDraft(this.state.editorText)
+    if (this.state.screen === 'draft' && this.state.manualMode) return this.createManualDraft(this.state.editorText, Boolean(this.state.draft && this.voiceDerivedDraftIds.has(this.state.draft.draft_id)))
     if (this.state.screen === 'draft' && this.state.revisionInstruction) return this.reviseDraft()
     if (this.state.screen === 'case') return this.generateDraft()
   }
@@ -845,11 +1226,12 @@ export class GlanceAppController {
   private async withBusy(
     action: string,
     operation: () => Promise<void>,
-    options: { keepKeyOnFailure?: boolean; keyScope?: string } = {},
+    options: { keepKeyOnFailure?: boolean; keyScope?: string; keyBook?: IdempotencyKeyBook } = {},
   ): Promise<void> {
     if (this.state.busy) return
     this.state.busy = true
     this.state.busyAction = action
+    const keyBook = options.keyBook ?? this.keys
     this.state.error = ''
     this.state.errorCode = null
     this.render()
@@ -865,7 +1247,7 @@ export class GlanceAppController {
         if (this.handleLostSession(error)) return
         const definitiveDraftFailure = ['draft_timeout', 'draft_unavailable'].includes(error.code)
         const retryableSameKey = (!definitiveDraftFailure && error.uncertain) || error.code === 'request_in_progress'
-        if (options.keyScope && !retryableSameKey) this.keys.complete(options.keyScope)
+        if (options.keyScope && !retryableSameKey) keyBook.complete(options.keyScope)
         if (error.code === 'unresolved_reply_exists' || error.code === 'multiple_unresolved_replies') {
           const current = await this.refreshCase()
           if (current?.latest_reply?.reply_id) {
@@ -878,7 +1260,7 @@ export class GlanceAppController {
           await this.refreshCase()
         }
       } else if (options.keyScope && !options.keepKeyOnFailure) {
-        this.keys.complete(options.keyScope)
+        keyBook.complete(options.keyScope)
       }
     } finally {
       this.state.busy = false
@@ -920,6 +1302,10 @@ export class GlanceAppController {
   private handleLostSession(error: unknown): boolean {
     if (!(error instanceof ApiError) || !['invalid_session', 'session_expired', 'session_revoked', 'owner_not_authorized'].includes(error.code)) return false
     if (!this.sessions.load()) {
+      void this.clearVoiceWorkflow('')
+      this.voiceDerivedDraftIds.clear()
+      this.keys.clear()
+      this.voiceKeys.clear()
       this.state.sessionPresent = false
       this.state.screen = 'pair'
       this.state.salonName = ''
@@ -938,7 +1324,10 @@ export class GlanceAppController {
   private async onVisibilityChange(): Promise<void> {
     this.foreground = document.visibilityState === 'visible'
     if (this.foreground) await this.onForegroundResume()
-    else this.clearReplyTimer()
+    else {
+      this.clearReplyTimer()
+      await this.stopForBackground()
+    }
   }
 
   private async onForegroundResume(): Promise<void> {
@@ -948,11 +1337,13 @@ export class GlanceAppController {
       this.state.sessionPresent = false
       this.state.screen = 'pair'
       this.state.message = 'Session expired. Pair this device again through Telegram.'
+      await this.clearVoiceWorkflow('')
+      this.voiceDerivedDraftIds.clear()
       this.render()
       return
     }
     if (this.state.screen === 'inbox') await this.loadInbox()
-    else if (this.state.caseData && ['case', 'draft', 'approval', 'resolve', 'status'].includes(this.state.screen)) {
+    else if (this.state.caseData && ['case', 'voice', 'draft', 'approval', 'resolve', 'status'].includes(this.state.screen)) {
       await this.refreshCase()
       if (this.state.screen === 'status' && this.state.replyId) await this.fetchReply(this.state.replyId, true)
     }
@@ -964,12 +1355,14 @@ export class GlanceAppController {
       this.state.sessionPresent = false
       this.state.screen = 'pair'
       this.state.message = 'Session expired. Pair this device again through Telegram.'
+      void this.clearVoiceWorkflow('')
+      this.voiceDerivedDraftIds.clear()
       this.render()
       return
     }
     if (this.state.screen === 'inbox' && this.state.sessionPresent || this.state.screen === 'inbox' && this.state.fixtureMode) {
       await this.loadInbox()
-    } else if (['case', 'draft', 'approval', 'resolve'].includes(this.state.screen) && this.state.caseData) {
+    } else if (['case', 'voice', 'draft', 'approval', 'resolve'].includes(this.state.screen) && this.state.caseData) {
       await this.refreshCase()
     }
   }
@@ -991,8 +1384,30 @@ export class GlanceAppController {
         }
         if (selected === 0) return this.generateDraft()
         if (selected === 1) return this.beginManualDraft()
-        if (selected === 2) return this.openLatestReply()
-        if (selected === 3) { this.state.screen = 'resolve'; this.render(); return }
+        if (selected === 2) return this.beginVoiceCapture()
+        if (selected === 3) return this.openLatestReply()
+        if (selected === 4) { this.state.screen = 'resolve'; this.render(); return }
+        break
+      case 'voice':
+        if (this.state.voicePhase === 'recording') {
+          if (selected === 0) return this.stopAndTranscribe('owner')
+          if (selected === 1) {
+            await this.clearVoiceWorkflow('Voice recording cancelled. Audio was cleared from memory.')
+            this.state.screen = 'case'
+            this.render()
+          }
+        } else if (this.state.voicePhase === 'transcript_ready') {
+          if (selected === 0) this.state.message = 'Choose Use as reply or Use as instruction on the phone.'
+          else this.state.message = 'The full transcript is shown on the paired phone.'
+          this.render()
+        } else if (this.state.voicePhase === 'error' || this.state.voicePhase === 'idle') {
+          if (selected === 0) return this.beginVoiceCapture()
+          if (selected === 1) {
+            await this.clearVoiceWorkflow('Voice workflow closed.')
+            this.state.screen = 'case'
+            this.render()
+          }
+        }
         break
       case 'draft':
         if (selected === 0) return this.openApproval()
@@ -1016,7 +1431,7 @@ export class GlanceAppController {
   }
 
   private nextActionIndex(delta: number): number {
-    const counts: Record<GlanceScreen, number> = { pair: 1, inbox: 1, case: 4, draft: 2, approval: 2, status: 3, resolve: 2 }
+    const counts: Record<GlanceScreen, number> = { pair: 1, inbox: 1, case: 5, voice: 2, draft: 2, approval: 2, status: 3, resolve: 2 }
     const count = this.state.screen === 'case' && this.state.caseData?.status === 'resolved'
       ? 2
       : counts[this.state.screen]
@@ -1024,6 +1439,9 @@ export class GlanceAppController {
   }
 
   private render(): void {
+    const previousScreen = this.renderedScreen
+    this.renderedScreen = this.state.screen
+    if (previousScreen === 'voice' && this.state.screen !== 'voice') void this.clearVoiceWorkflow('')
     this.root.innerHTML = this.renderScreen()
     this.updateGlasses()
   }
@@ -1039,6 +1457,7 @@ export class GlanceAppController {
     const screen = this.state.screen === 'pair' ? this.renderPair() :
       this.state.screen === 'inbox' ? this.renderInbox() :
       this.state.screen === 'case' ? this.renderCase() :
+      this.state.screen === 'voice' ? this.renderVoice() :
       this.state.screen === 'draft' ? this.renderDraft() :
       this.state.screen === 'approval' ? this.renderApproval() :
       this.state.screen === 'status' ? this.renderStatus() : this.renderResolve()
@@ -1068,7 +1487,37 @@ export class GlanceAppController {
     const latest = item.latest_reply ? `<div class="latest-reply"><span class="eyebrow">LATEST REPLY</span><strong>${escapeHtml(presentReplyState(item.latest_reply.state, item.channel).label)}</strong><button class="text-button" data-action="open-latest-reply">Inspect status →</button></div>` : ''
     const stale = this.state.stale ? '<div class="stale-strip">Case changed · refresh and create a current draft before approval.</div>' : ''
     const thread = events.map((event) => `<article class="message ${escapeHtml(event.actor)}"><div class="message-meta"><strong>${escapeHtml(event.actor === 'customer' ? item.customer_label : event.actor === 'assistant' ? 'RemboAI' : 'Owner')}</strong><time>${escapeHtml(dateTime(event.created_at))}</time></div><p>${escapeHtml(event.text)}</p></article>`).join('')
-    return `<section class="panel case-panel"><button class="text-button back-link" data-action="back-inbox">← Inbox</button><div class="section-heading"><div><p class="eyebrow">${escapeHtml(categoryLabel(item.category))} · ${escapeHtml(item.channel.toUpperCase())}</p><h1>${escapeHtml(item.customer_label)}</h1></div><span class="status-tag ${item.status === 'resolved' ? 'resolved' : ''}">${escapeHtml(caseStatusText(item.status))} · v${item.version}</span></div>${stale}<p class="issue-summary">${escapeHtml(this.caseSummary(item))}</p><div class="context-label"><span>Customer-visible conversation</span>${item.has_earlier ? '<strong>Earlier messages omitted</strong>' : ''}</div><div class="thread-chunk">${thread || '<p class="subtle">No visible conversation is available.</p>'}</div><div class="chunk-nav">${button('Previous messages', 'page-back', { disabled: this.state.messagePage <= 0 })}<span>Chunk ${this.state.messagePage + 1} of ${pages}</span>${button('Next messages', 'page-next', { disabled: this.state.messagePage >= pages - 1 })}</div>${latest}<div class="button-row wrap">${button('Generate AI suggestion', 'generate-draft', { primary: true, disabled: item.status !== 'open' || this.state.busy })}${button('Write a reply', 'write-manually', { disabled: item.status !== 'open' || this.state.busy })}${button('Resolve case', 'resolve', { disabled: item.status !== 'open' || this.state.busy })}${button('Refresh context', 'refresh-case')}</div><p class="poll-note">Context refreshes while this case is open. Drafts remain unsent until you approve exact text.</p></section>`
+    return `<section class="panel case-panel"><button class="text-button back-link" data-action="back-inbox">← Inbox</button><div class="section-heading"><div><p class="eyebrow">${escapeHtml(categoryLabel(item.category))} · ${escapeHtml(item.channel.toUpperCase())}</p><h1>${escapeHtml(item.customer_label)}</h1></div><span class="status-tag ${item.status === 'resolved' ? 'resolved' : ''}">${escapeHtml(caseStatusText(item.status))} · v${item.version}</span></div>${stale}<p class="issue-summary">${escapeHtml(this.caseSummary(item))}</p><div class="context-label"><span>Customer-visible conversation</span>${item.has_earlier ? '<strong>Earlier messages omitted</strong>' : ''}</div><div class="thread-chunk">${thread || '<p class="subtle">No visible conversation is available.</p>'}</div><div class="chunk-nav">${button('Previous messages', 'page-back', { disabled: this.state.messagePage <= 0 })}<span>Chunk ${this.state.messagePage + 1} of ${pages}</span>${button('Next messages', 'page-next', { disabled: this.state.messagePage >= pages - 1 })}</div>${latest}<div class="button-row wrap">${button('Generate AI suggestion', 'generate-draft', { primary: true, disabled: item.status !== 'open' || this.state.busy })}${button('Write a reply', 'write-manually', { disabled: item.status !== 'open' || this.state.busy })}${button('Record voice correction', 'start-voice', { disabled: item.status !== 'open' || this.state.busy || this.state.fixtureMode || !this.state.sessionPresent || !this.state.glassesAvailable })}${button('Resolve case', 'resolve', { disabled: item.status !== 'open' || this.state.busy })}${button('Refresh context', 'refresh-case')}</div><p class="poll-note">Voice recording starts only after your action. Drafts remain unsent until you approve exact text.</p></section>`
+  }
+
+  private renderVoice(): string {
+    const phase = this.state.voicePhase
+    const item = this.state.caseData
+    if (!item) return this.renderLoading('Loading case')
+    const duration = this.formatDuration(this.state.voiceDurationMs)
+    if (phase === 'recording') {
+      return `<section class="panel voice-panel"><button class="text-button back-link" data-action="cancel-voice">← Cancel voice workflow</button><p class="eyebrow">G2 MICROPHONE ACTIVE</p><h1>Recording</h1><div class="recording-indicator"><span class="recording-dot"></span><strong>Microphone on</strong><span class="voice-duration">${duration}</span></div><p class="lead">Speak a short message. Stop when you are done. The recording stays in memory and is not saved.</p><div class="button-row">${button('Stop and transcribe', 'stop-voice', { primary: true })}${button('Cancel', 'cancel-voice')}</div><small>Maximum 40 seconds · G2 microphone only</small></section>`
+    }
+    if (phase === 'transcript_ready') {
+      const draft = this.state.draft
+      const canInstruction = canUseTranscriptAsInstruction(item, draft, this.state.stale, this.state.editorText, this.state.voiceTranscript)
+      const instructionWhy = !draft || draft.source !== 'ai'
+        ? 'To use this as an instruction, first create an AI suggestion for this case.'
+        : [...this.state.voiceTranscript].length > 300
+          ? 'Instructions are limited to 300 characters. Record a shorter instruction.'
+          : !canInstruction
+            ? 'Refresh the case and keep a current, unedited AI suggestion before using an instruction.'
+            : 'This will revise the current AI suggestion only. The transcript is not a customer reply.'
+      return `<section class="panel voice-panel"><button class="text-button back-link" data-action="voice-back-case">← Case</button><p class="eyebrow">TRANSCRIPT · NOT SENT</p><h1>Choose what you meant</h1><div class="voice-facts"><span>Captured ${duration}</span><span>Transcription ${this.state.voiceTranscriptionDurationMs ?? 0} ms</span></div><label for="voice-transcript">Recognized words</label><textarea id="voice-transcript" class="transcript-text" rows="6" readonly>${escapeHtml(this.state.voiceTranscript)}</textarea><div class="intent-cards"><div><h2>Use as reply</h2><p>Create an owner-authored draft from these words. You can edit the full reply before approval.</p>${button('Use as reply', 'use-transcript-reply', { primary: true, disabled: this.state.busy || item.status !== 'open' })}</div><div><h2>Use as instruction</h2><p>${escapeHtml(instructionWhy)}</p>${button('Use as instruction', 'use-transcript-instruction', { disabled: this.state.busy || !canInstruction })}</div></div><p class="subtle">Neither choice sends a message. Exact outgoing text still requires your separate approval.</p>${button('Record again', 'start-voice')}</section>`
+    }
+    if (phase === 'starting' || phase === 'stopping' || phase === 'transcribing') {
+      const label = phase === 'starting' ? 'Starting microphone' : phase === 'stopping' ? 'Stopping microphone' : 'Transcribing'
+      return `<section class="panel voice-panel"><button class="text-button back-link" data-action="cancel-voice">← Cancel</button><div class="spinner" aria-hidden="true"></div><p class="eyebrow">${phase === 'transcribing' ? 'AUDIO IN MEMORY ONLY' : 'G2 MICROPHONE'}</p><h1>${label}</h1><p class="subtle">${phase === 'transcribing' ? 'No automatic retry. The audio buffer is cleared when this request ends.' : 'Glance will not start recording in the background.'}</p></section>`
+    }
+    if (phase === 'error') {
+      return `<section class="panel voice-panel"><button class="text-button back-link" data-action="voice-back-case">← Case</button><p class="eyebrow">VOICE CAPTURE</p><h1>Recording stopped</h1><div class="warning-card">${escapeHtml(this.state.voiceError || 'Voice capture could not continue.')}${this.state.requestId ? `<small>Request ID: ${escapeHtml(this.state.requestId)}</small>` : ''}${this.state.retryAfter !== null ? `<small>Try again after ${this.state.retryAfter}s.</small>` : ''}</div><p class="subtle">No recording is retained. Start a new recording to try again.</p>${button('Record again', 'start-voice', { primary: true, disabled: this.state.busy || !this.state.glassesAvailable })}</section>`
+    }
+    return `<section class="panel voice-panel"><button class="text-button back-link" data-action="voice-back-case">← Case</button><p class="eyebrow">OWNER-STARTED VOICE</p><h1>Ready to record</h1><p class="lead">The G2 microphone opens only after you choose Record. Speak briefly, stop, then review the transcript on your phone.</p>${button('Start G2 recording', 'start-voice', { primary: true, disabled: this.state.busy || !this.state.glassesAvailable || this.state.fixtureMode })}</section>`
   }
 
   private renderDraft(): string {
@@ -1143,16 +1592,24 @@ export class GlanceAppController {
     return lastCustomer?.text ?? 'A customer request needs your attention.'
   }
 
-  private uncertainNote(scope: string): string {
-    if (!this.keys.has(scope)) return ''
+  private uncertainNote(scope: string, voiceDerived = false): string {
+    if (!(voiceDerived ? this.voiceKeys : this.keys).has(scope)) return ''
     return '<p class="warning-inline">The request outcome is uncertain. Keep the same text and retry with the same action key.</p>'
   }
 
   private canRetrySameAction(): boolean {
     if (!['request_in_progress', 'request_timeout', 'network_error', 'reply_unavailable'].includes(this.state.errorCode ?? '')) return false
-    if (this.state.screen === 'approval' && this.keys.has(`approve:${this.state.caseData?.case_id}`)) return true
-    if (this.state.screen === 'draft' && this.state.manualMode && this.keys.has(`manual-draft:${this.state.caseData?.case_id}`)) return true
-    if (this.state.screen === 'draft' && this.state.draft && this.keys.has(`revise:${this.state.caseData?.case_id}:${this.state.draft.draft_id}`)) return true
+    const draftIsVoiceDerived = Boolean(this.state.draft && this.voiceDerivedDraftIds.has(this.state.draft.draft_id))
+    const retryKeys = draftIsVoiceDerived ? this.voiceKeys : this.keys
+    if (this.state.screen === 'voice' && this.state.caseData) {
+      const caseId = this.state.caseData.case_id
+      if (this.voiceKeys.has(`voice-manual:${caseId}`)) return true
+      const draftId = this.state.draft?.draft_id
+      if (draftId && this.voiceKeys.has(`voice-revise:${caseId}:${draftId}`)) return true
+    }
+    if (this.state.screen === 'approval' && retryKeys.has(`approve:${this.state.caseData?.case_id}`)) return true
+    if (this.state.screen === 'draft' && this.state.manualMode && retryKeys.has(`${draftIsVoiceDerived ? 'voice-manual' : 'manual-draft'}:${this.state.caseData?.case_id}`)) return true
+    if (this.state.screen === 'draft' && this.state.draft && retryKeys.has(`${draftIsVoiceDerived ? 'voice-revise' : 'revise'}:${this.state.caseData?.case_id}:${this.state.draft.draft_id}`)) return true
     if (this.state.screen === 'case' && this.state.caseData && this.keys.has(`ai-draft:${this.state.caseData.case_id}`)) return true
     return false
   }
@@ -1203,7 +1660,30 @@ export class GlanceAppController {
       const chunk = messagePage(item.context, state.messagePage, 3)
       const message = [...chunk].reverse().find((entry) => entry.actor === 'customer') ?? chunk.at(-1)
       lines.push(oneLine(message ? `C: ${message.text}` : this.caseSummary(item)))
-      lines.push(actionLabel(['GENERATE DRAFT', 'WRITE REPLY', 'CHECK REPLY', 'RESOLVE CASE']))
+      lines.push(actionLabel(['GENERATE DRAFT', 'WRITE REPLY', 'VOICE CORRECTION', 'CHECK REPLY', 'RESOLVE CASE']))
+      return lines.join('\n')
+    }
+    if (state.screen === 'voice') {
+      if (state.voicePhase === 'recording') {
+        lines.push('MICROPHONE ACTIVE')
+        lines.push(`CAPTURED ${this.formatDuration(state.voiceDurationMs)}`)
+        lines.push('SPEAK · STOP WHEN DONE')
+        lines.push(actionLabel(['STOP & TRANSCRIBE', 'CANCEL']))
+      } else if (state.voicePhase === 'transcript_ready') {
+        lines.push('TRANSCRIPT READY · NOT SENT')
+        lines.push(oneLine(state.voiceTranscript))
+        lines.push('CHOOSE INTENT ON PHONE')
+        lines.push(actionLabel(['OPEN PHONE REVIEW', 'BACK TO CASE']))
+      } else if (state.voicePhase === 'error') {
+        lines.push('VOICE CAPTURE STOPPED')
+        lines.push(oneLine(state.voiceError || 'TRY AGAIN ON PHONE'))
+        lines.push(actionLabel(['RECORD AGAIN', 'BACK TO CASE']))
+      } else {
+        lines.push(state.voicePhase === 'starting' ? 'MICROPHONE STARTING' : state.voicePhase === 'stopping' ? 'STOPPING MICROPHONE' : state.voicePhase === 'transcribing' ? 'TRANSCRIBING' : 'VOICE READY')
+        lines.push(state.voicePhase === 'transcribing' ? 'AUDIO IN MEMORY ONLY' : 'G2 MICROPHONE ONLY')
+        lines.push('FULL REVIEW ON PHONE')
+        lines.push(actionLabel(['RECORD / REVIEW', 'BACK TO CASE']))
+      }
       return lines.join('\n')
     }
     if (state.screen === 'draft') {

@@ -73,6 +73,11 @@ export interface DraftData {
   expires_at: string
 }
 
+export interface TranscriptionData {
+  transcript: string
+  duration_ms: number
+}
+
 export interface ReplyResult {
   reply_id: string
   state: 'queued'

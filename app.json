@@ -13,6 +13,10 @@
       "whitelist": [
         "https://remboai.duckdns.org"
       ]
+    },
+    {
+      "name": "g2-microphone",
+      "desc": "Capture owner-initiated short voice corrections from the G2 microphone."
     }
   ],
   "supported_languages": ["en"]
