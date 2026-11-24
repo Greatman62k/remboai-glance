@@ -4,7 +4,7 @@ import {
   TextContainerProperty,
 } from '@evenrealities/even_hub_sdk'
 import type { AppStateView } from './state-view.ts'
-import { categoryLabel, presentReplyState, relativeAge } from './workflow.ts'
+import { categoryLabel, CONTEXT_PAGE_SIZE, messagePage, presentReplyState } from './workflow.ts'
 
 export type GlassesScreenId =
   | 'pair'
@@ -158,13 +158,6 @@ function pageWithList(header: string, items: string[], footer: string): GlassesP
   }
 }
 
-function currentCustomerMessage(state: GlassesState): string {
-  const item = state.caseData
-  if (!item) return 'A customer request needs your attention.'
-  return [...item.context].reverse().find((message) => message.actor === 'customer')?.text
-    ?? 'A customer request needs your attention.'
-}
-
 function formatDuration(milliseconds: number): string {
   const seconds = Math.min(40, Math.max(0, Math.floor(milliseconds / 1_000)))
   return `00:${String(seconds).padStart(2, '0')}`
@@ -183,7 +176,7 @@ function inboxPage(state: GlassesState): GlassesPage {
       `${item.customer_label}  |  ${categoryLabel(item.category).toUpperCase()}`,
       64,
     ))
-    return pageWithList(header, names, 'SCROLL TO SELECT  |  DOUBLE TAP OPEN')
+    return pageWithList(header, names, 'TAP: OPEN  |  SWIPE: SELECT')
   }
 
   const body = state.connection === 'loading'
@@ -214,20 +207,32 @@ function casePage(state: GlassesState): GlassesPage {
   const channel = item.channel === 'telegram' ? 'TELEGRAM' : 'WHATSAPP'
   const customer = compactLine(item.customer_label.toUpperCase(), 40)
   const category = compactLine(categoryLabel(item.category).toUpperCase(), 40)
-  const message = wrapGlassesPreview(currentCustomerMessage(state), 2, 46)
+  const pageSize = CONTEXT_PAGE_SIZE
+  const pageCount = Math.ceil(item.context.length / pageSize)
+  const requestedPage = Number.isFinite(state.messagePage) ? Math.floor(state.messagePage) : 0
+  const pageIndex = pageCount > 0
+    ? Math.min(Math.max(0, requestedPage), pageCount - 1)
+    : 0
+  const chronologicalPage = pageCount > 0 ? pageCount - 1 - pageIndex : 0
+  const visibleMessages = messagePage(item.context, chronologicalPage, pageSize)
+  const contextLabel = pageCount === 0
+    ? 'MSG 0/0'
+    : `MSG ${pageIndex + 1}/${pageCount}${item.has_earlier && pageIndex === pageCount - 1 ? '  OLDER OMITTED' : ''}`
+  const contextLines = visibleMessages.map((message) => {
+    const actor = message.actor === 'customer' ? 'CUST' : message.actor === 'assistant' ? 'REMBO' : 'OWNER'
+    return `${actor}  ${wrapGlassesPreview(message.text, 1, 38)}`
+  })
   const actions = ['GENERATE AI DRAFT', 'WRITE REPLY ON PHONE', 'VOICE INPUT', 'CHECK REPLY STATUS', 'RESOLVE CASE', 'BACK TO INBOX']
   const selected = actions[state.focusedAction % actions.length]
-  const age = item.context.length ? relativeAge(item.context.at(-1)!.created_at).toUpperCase() : ''
   const body = [
-    `${customer}  |  OPEN`,
+    `${customer}  |  OPEN  |  V${item.version}`,
     `${category}  |  ${channel}`,
-    age ? `UPDATED  ${firmwareText(age)}` : '',
-    'LATEST CUSTOMER MESSAGE',
-    `"${message}"`,
+    contextLabel,
+    ...(contextLines.length ? contextLines : ['NO CUSTOMER-VISIBLE MESSAGES']),
     state.stale ? 'CONTEXT MAY BE STALE' : '',
     `ACTION  > ${selected}`,
   ].filter(Boolean).join('\n')
-  return pageWithText('case', appHeader(state, 'CASE DETAIL'), body, 'CLICK NEXT ACTION  |  DOUBLE TAP OPEN')
+  return pageWithText('case', appHeader(state, 'CASE DETAIL'), body, 'SCROLL CONTEXT  |  CLICK ACTION  |  DOUBLE TAP')
 }
 
 function draftPage(state: GlassesState, exactApproval = false): GlassesPage {
@@ -279,11 +284,15 @@ function voicePage(state: GlassesState): GlassesPage {
     )
   }
   if (phase === 'error') {
+    const actions = ['RETRY', 'BACK TO CASE']
+    const action = state.focusedAction % actions.length === 0
+      ? `> ${actions[0]}  |  ${actions[1]}`
+      : `${actions[0]}  |  > ${actions[1]}`
     return pageWithText(
       'voice-ready',
       appHeader(state, 'VOICE INPUT'),
-      `CAPTURE STOPPED\n\n${wrapGlassesPreview(state.voiceError || 'NO AUDIO RETAINED', 2)}`,
-      'RETURN TO CASE TO RECORD AGAIN',
+      `CAPTURE STOPPED  |  MIC OFF\n${wrapGlassesPreview(state.voiceError || 'NO AUDIO RETAINED', 2)}\n${action}`,
+      'CLICK TO CHOOSE  |  DOUBLE TAP SELECT',
     )
   }
   if (phase === 'starting' || phase === 'stopping' || phase === 'transcribing') {
@@ -295,14 +304,15 @@ function voicePage(state: GlassesState): GlassesPage {
       'PLEASE WAIT',
     )
   }
-  const actions = ['START RECORDING', 'BACK TO CASE']
+  const actions = ['START', 'BACK']
   const action = state.focusedAction % actions.length === 0
     ? `> ${actions[0]}  |  ${actions[1]}`
     : `${actions[0]}  |  > ${actions[1]}`
+  const simulation = state.voiceSimulation ? 'SIMULATION  |  MIC OFF\n' : ''
   return pageWithText(
     'voice-ready',
     appHeader(state, 'VOICE INPUT'),
-    `MICROPHONE OFF\nREADY WHEN YOU ARE\nMAX 40 SECONDS\n${action}`,
+    `${simulation}MICROPHONE OFF\nREADY WHEN YOU ARE\nMAX 40 SECONDS\n${action}`,
     'CLICK TO CHOOSE  |  DOUBLE TAP SELECT',
   )
 }
@@ -348,7 +358,11 @@ function resolvePage(state: GlassesState): GlassesPage {
       : item.latest_reply?.state === 'sending'
         ? 'REPLY SENDING  |  WAIT BEFORE RESOLVE'
         : ''
-  const action = state.focusedAction === 0 ? '> RESOLVE CASE' : '> CANCEL'
+  const action = state.focusedAction === 0
+    ? '> CONFIRM RESOLVE  |  CANCEL'
+    : state.focusedAction === 1
+      ? 'CONFIRM RESOLVE  |  > CANCEL'
+      : 'ACTION SELECTION INVALID'
   return pageWithText(
     'resolve',
     appHeader(state, 'RESOLVE CASE'),

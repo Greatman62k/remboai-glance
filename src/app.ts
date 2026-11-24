@@ -17,6 +17,7 @@ import { buildGlassesPage, glassesPageText, type GlassesPage } from './glasses-u
 import {
   IdempotencyKeyBook,
   categoryLabel,
+  CONTEXT_PAGE_SIZE,
   messagePage,
   moreCaseCount,
   normalizeOwnerText,
@@ -134,6 +135,7 @@ export class GlanceAppController {
   private glassesWriter: ((page: GlassesPage) => void) | null = null
   private readonly physicalPresses = new PhysicalPressDeduplicator()
   private audioControl: AudioInputControl | null = null
+  private pageShutdownControl: ((exitMode: number) => Promise<boolean>) | null = null
   private replyTimer: number | null = null
   private pollTimer: number | null = null
   private foreground = true
@@ -186,6 +188,10 @@ export class GlanceAppController {
     this.updateGlasses()
   }
 
+  setPageShutdownControl(shutdown: ((exitMode: number) => Promise<boolean>) | null): void {
+    this.pageShutdownControl = shutdown
+  }
+
   setGlassesAvailable(available: boolean): void {
     if (this.state.glassesAvailable === available) return
     this.state.glassesAvailable = available
@@ -231,11 +237,27 @@ export class GlanceAppController {
     return this.lastRenderedGlasses
   }
 
+  private enterVoiceReady(): void {
+    const item = this.state.caseData
+    if (!item || item.status !== 'open' || this.state.busy) return
+    this.state.focusedAction = 0
+    this.state.voicePhase = 'idle'
+    this.state.voiceDurationMs = 0
+    this.state.voiceTranscriptionDurationMs = null
+    this.state.voiceTranscript = ''
+    this.state.voiceSimulation = this.state.fixtureMode
+    this.state.voiceError = ''
+    this.state.screen = 'voice'
+    this.state.message = 'Microphone is off. Choose Start when you are ready.'
+    this.render()
+  }
+
   private async beginVoiceCapture(): Promise<void> {
     const item = this.state.caseData
     if (this.state.busy || this.state.voicePhase === 'starting' || this.state.voicePhase === 'recording' ||
         this.state.voicePhase === 'stopping' || this.state.voicePhase === 'transcribing') return
-    if (!item || item.status !== 'open' || this.state.screen !== 'case' && this.state.screen !== 'voice') return
+    if (!item || item.status !== 'open' || this.state.screen !== 'voice' ||
+        !['idle', 'error'].includes(this.state.voicePhase)) return
     if (this.state.fixtureMode || !this.state.sessionPresent || !this.sessions.load()) {
       this.failLocal('Pair this device with a live owner session before using voice transcription.', 'session_expired')
       return
@@ -634,8 +656,11 @@ export class GlanceAppController {
           this.state.selectedIndex = (this.state.selectedIndex + delta + count) % count
         }
       } else if (this.state.screen === 'case' && this.state.caseData) {
-        const pages = Math.max(1, Math.ceil(this.state.caseData.context.length / 3))
-        this.state.messagePage = Math.min(pages - 1, Math.max(0, this.state.messagePage + delta))
+        const pages = Math.ceil(this.state.caseData.context.length / CONTEXT_PAGE_SIZE)
+        const lastPage = Math.max(0, pages - 1)
+        const currentPage = Number.isFinite(this.state.messagePage) ? Math.floor(this.state.messagePage) : 0
+        const pageDelta = input.kind === 'scroll_up' ? 1 : -1
+        this.state.messagePage = Math.min(lastPage, Math.max(0, currentPage + pageDelta))
       } else {
         this.state.focusedAction = this.nextActionIndex(delta)
       }
@@ -643,6 +668,10 @@ export class GlanceAppController {
       return
     }
     if (input.kind === 'click') {
+      if (this.state.screen === 'inbox') {
+        await this.openSelectedInboxCase()
+        return
+      }
       this.state.focusedAction = this.nextActionIndex(1)
       this.render()
       return
@@ -670,7 +699,10 @@ export class GlanceAppController {
 
     if (action === 'start-demo') return this.startDemo()
     if (action === 'simulate-voice') return this.showDemoTranscript()
-    if (action === 'start-demo-recording') return this.beginDemoRecording()
+    if (action === 'start-demo-recording') {
+      if (this.state.screen === 'case') return this.enterVoiceReady()
+      return this.beginDemoRecording()
+    }
     if (action === 'pair') return this.pair()
     if (action === 'refresh-inbox') return this.loadInbox()
     if (action === 'open-case') return this.openCase(target.dataset.caseId ?? '')
@@ -679,7 +711,11 @@ export class GlanceAppController {
       if (item) return this.openCase(item.case_id)
     }
     if (action === 'refresh-case') { await this.refreshCase(true); return }
-    if (action === 'start-voice') return this.beginVoiceCapture()
+    if (action === 'open-voice-ready') return this.enterVoiceReady()
+    if (action === 'start-voice') {
+      if (this.state.screen === 'case') return this.enterVoiceReady()
+      return this.beginVoiceCapture()
+    }
     if (action === 'stop-voice') return this.state.fixtureMode ? this.stopDemoRecording() : this.stopAndTranscribe('owner')
     if (action === 'cancel-voice') {
       await this.clearVoiceWorkflow('Voice recording cancelled. Audio was cleared from memory.')
@@ -714,9 +750,7 @@ export class GlanceAppController {
     if (action === 'resolve') {
       const fresh = await this.refreshCase()
       if (!fresh) return
-      this.state.screen = 'resolve'
-      this.state.acknowledgedUnknown = false
-      this.render()
+      this.enterResolveScreen()
       return
     }
     if (action === 'cancel-resolve') {
@@ -740,14 +774,13 @@ export class GlanceAppController {
       return
     }
     if (action === 'page-back') {
-      this.state.messagePage = Math.max(0, this.state.messagePage - 1)
+      const pages = Math.max(1, Math.ceil((this.state.caseData?.context.length ?? 0) / CONTEXT_PAGE_SIZE))
+      this.state.messagePage = Math.min(pages - 1, Math.max(0, this.state.messagePage + 1))
       this.render()
       return
     }
     if (action === 'page-next') {
-      const count = this.state.caseData?.context.length ?? 0
-      const pages = Math.max(1, Math.ceil(count / 3))
-      this.state.messagePage = Math.min(pages - 1, this.state.messagePage + 1)
+      this.state.messagePage = Math.max(0, this.state.messagePage - 1)
       this.render()
       return
     }
@@ -916,10 +949,22 @@ export class GlanceAppController {
       this.state.editorText = ''
       this.state.reply = null
       this.state.replyId = data.latest_reply?.reply_id ?? null
+      this.state.focusedAction = 0
       this.state.screen = 'case'
       this.state.connection = this.state.fixtureMode ? 'development-fixtures' : 'connected'
       this.clearError()
     })
+  }
+
+  private async openSelectedInboxCase(): Promise<void> {
+    const items = this.state.inbox?.items ?? []
+    if (!items.length) return
+    const index = Number.isInteger(this.state.selectedIndex)
+      ? Math.min(items.length - 1, Math.max(0, this.state.selectedIndex))
+      : 0
+    this.state.selectedIndex = index
+    const selected = items[index]
+    if (selected?.status === 'open') await this.openCase(selected.case_id)
   }
 
   private async refreshCase(showFeedback = false): Promise<CaseData | null> {
@@ -931,6 +976,9 @@ export class GlanceAppController {
       const latestReplyChanged = JSON.stringify(fresh.latest_reply) !== JSON.stringify(current.latest_reply)
       const previousConnection = this.state.connection
       this.state.caseData = fresh
+      const lastPage = Math.max(0, Math.ceil(fresh.context.length / CONTEXT_PAGE_SIZE) - 1)
+      const currentPage = Number.isFinite(this.state.messagePage) ? Math.floor(this.state.messagePage) : 0
+      this.state.messagePage = Math.min(lastPage, Math.max(0, currentPage))
       this.state.replyId = fresh.latest_reply?.reply_id ?? this.state.replyId
       if (this.state.draft && this.state.draft.based_on_version === fresh.version && Date.parse(this.state.draft.expires_at) > Date.now()) {
         this.state.stale = false
@@ -1300,6 +1348,13 @@ export class GlanceAppController {
     })
   }
 
+  private enterResolveScreen(): void {
+    this.state.focusedAction = 0
+    this.state.acknowledgedUnknown = false
+    this.state.screen = 'resolve'
+    this.render()
+  }
+
   private async revokeCurrentDevice(): Promise<void> {
     if (this.state.fixtureMode) {
       this.stopDemo()
@@ -1540,7 +1595,17 @@ export class GlanceAppController {
   private async activateGlassAction(): Promise<void> {
     const selected = this.state.focusedAction
     switch (this.state.screen) {
-      case 'inbox': return this.openCase(this.state.inbox?.items[this.state.selectedIndex]?.case_id ?? '')
+      // A single click opens the selected row. Keep root double-click for the
+      // Even Hub root-page exit behavior.
+      case 'inbox':
+        if (this.pageShutdownControl) {
+          try {
+            await this.pageShutdownControl(1)
+          } catch (error) {
+            this.captureError(error)
+          }
+        }
+        return
       case 'case':
         if (this.state.caseData?.status === 'resolved') {
           if (selected === 0 && this.state.caseData.latest_reply) return this.openLatestReply()
@@ -1549,9 +1614,9 @@ export class GlanceAppController {
         }
         if (selected === 0) return this.generateDraft()
         if (selected === 1) return this.beginManualDraft()
-        if (selected === 2) return this.state.fixtureMode ? this.beginDemoRecording() : this.beginVoiceCapture()
+        if (selected === 2) return this.enterVoiceReady()
         if (selected === 3) return this.openLatestReply()
-        if (selected === 4) { this.state.screen = 'resolve'; this.render(); return }
+        if (selected === 4) { this.enterResolveScreen(); return }
         if (selected === 5) { this.state.screen = 'inbox'; this.render(); return }
         break
       case 'voice':
@@ -1567,7 +1632,7 @@ export class GlanceAppController {
           else this.state.message = 'The full transcript is shown on the paired phone.'
           this.render()
         } else if (this.state.voicePhase === 'error' || this.state.voicePhase === 'idle') {
-          if (selected === 0) return this.beginVoiceCapture()
+          if (selected === 0) return this.state.fixtureMode ? this.beginDemoRecording() : this.beginVoiceCapture()
           if (selected === 1) {
             await this.clearVoiceWorkflow('Voice workflow closed.')
             this.state.screen = 'case'
@@ -1589,12 +1654,14 @@ export class GlanceAppController {
         break
       case 'status':
         if (selected === 0) return this.checkReplyStatus()
-        if (selected === 1) { this.state.screen = 'resolve'; this.render(); return }
+        if (selected === 1) { this.enterResolveScreen(); return }
         if (selected === 2) { this.state.screen = 'inbox'; this.render(); return }
         break
       case 'resolve':
         if (selected === 0) return this.resolveCase()
         if (selected === 1) { this.state.screen = 'case'; this.render(); return }
+        this.state.focusedAction = 0
+        this.render()
         break
       case 'pair': return
     }
@@ -1652,15 +1719,18 @@ export class GlanceAppController {
   private renderCase(): string {
     const item = this.state.caseData
     if (!item) return this.renderLoading('Loading case')
-    const events = messagePage(item.context, this.state.messagePage, 3)
-    const pages = Math.max(1, Math.ceil(item.context.length / 3))
+    const pages = Math.max(1, Math.ceil(item.context.length / CONTEXT_PAGE_SIZE))
+    const pageNumber = Number.isFinite(this.state.messagePage)
+      ? Math.min(pages - 1, Math.max(0, Math.floor(this.state.messagePage)))
+      : 0
+    const events = messagePage(item.context, pages - 1 - pageNumber, CONTEXT_PAGE_SIZE)
     const latest = item.latest_reply ? `<div class="latest-reply"><span class="eyebrow">LATEST REPLY</span><strong>${escapeHtml(presentReplyState(item.latest_reply.state, item.channel).label)}</strong><button class="text-button" data-action="open-latest-reply">Inspect status →</button></div>` : ''
     const stale = this.state.stale ? '<div class="stale-strip">Case changed · refresh and create a current draft before approval.</div>' : ''
     const thread = events.map((event) => `<article class="message ${escapeHtml(event.actor)}"><div class="message-meta"><strong>${escapeHtml(event.actor === 'customer' ? item.customer_label : event.actor === 'assistant' ? 'RemboAI' : 'Owner')}</strong><time>${escapeHtml(dateTime(event.created_at))}</time></div><p>${escapeHtml(event.text)}</p></article>`).join('')
     const voiceAction = this.state.fixtureMode
-      ? button('Start simulated capture', 'start-demo-recording', { disabled: item.status !== 'open' || this.state.busy })
+      ? button('Open simulated voice controls', 'open-voice-ready', { disabled: item.status !== 'open' || this.state.busy })
       : button('Record voice correction', 'start-voice', { disabled: item.status !== 'open' || this.state.busy || !this.state.sessionPresent || !this.state.glassesAvailable })
-    return `<section class="panel case-panel"><button class="text-button back-link" data-action="back-inbox">← Inbox</button><div class="section-heading"><div><p class="eyebrow">${escapeHtml(categoryLabel(item.category))} · ${escapeHtml(item.channel.toUpperCase())}</p><h1>${escapeHtml(item.customer_label)}</h1></div><span class="status-tag ${item.status === 'resolved' ? 'resolved' : ''}">${escapeHtml(caseStatusText(item.status))} · v${item.version}</span></div>${stale}<p class="issue-summary">${escapeHtml(this.caseSummary(item))}</p><div class="context-label"><span>Customer-visible conversation</span>${item.has_earlier ? '<strong>Earlier messages omitted</strong>' : ''}</div><div class="thread-chunk">${thread || '<p class="subtle">No visible conversation is available.</p>'}</div><div class="chunk-nav">${button('Previous messages', 'page-back', { disabled: this.state.messagePage <= 0 })}<span>Chunk ${this.state.messagePage + 1} of ${pages}</span>${button('Next messages', 'page-next', { disabled: this.state.messagePage >= pages - 1 })}</div>${latest}<div class="button-row wrap">${button('Generate AI suggestion', 'generate-draft', { primary: true, disabled: item.status !== 'open' || this.state.busy })}${button('Write a reply', 'write-manually', { disabled: item.status !== 'open' || this.state.busy })}${voiceAction}${button('Resolve case', 'resolve', { disabled: item.status !== 'open' || this.state.busy })}${button('Refresh context', 'refresh-case')}</div><p class="poll-note">${this.state.fixtureMode ? 'SIMULATED TRANSCRIPT · fixture only; no microphone, ASR, backend, or message send.' : 'Voice recording starts only after your action. Drafts remain unsent until you approve exact text.'}</p></section>`
+    return `<section class="panel case-panel"><button class="text-button back-link" data-action="back-inbox">← Inbox</button><div class="section-heading"><div><p class="eyebrow">${escapeHtml(categoryLabel(item.category))} · ${escapeHtml(item.channel.toUpperCase())}</p><h1>${escapeHtml(item.customer_label)}</h1></div><span class="status-tag ${item.status === 'resolved' ? 'resolved' : ''}">${escapeHtml(caseStatusText(item.status))} · v${item.version}</span></div>${stale}<p class="issue-summary">${escapeHtml(this.caseSummary(item))}</p><div class="context-label"><span>Customer-visible conversation</span>${item.has_earlier ? '<strong>Earlier messages omitted</strong>' : ''}</div><div class="thread-chunk">${thread || '<p class="subtle">No visible conversation is available.</p>'}</div><div class="chunk-nav">${button('Previous messages', 'page-back', { disabled: pageNumber >= pages - 1 })}<span>Chunk ${pageNumber + 1} of ${pages} · newest first</span>${button('Next messages', 'page-next', { disabled: pageNumber <= 0 })}</div>${latest}<div class="button-row wrap">${button('Generate AI suggestion', 'generate-draft', { primary: true, disabled: item.status !== 'open' || this.state.busy })}${button('Write a reply', 'write-manually', { disabled: item.status !== 'open' || this.state.busy })}${voiceAction}${button('Resolve case', 'resolve', { disabled: item.status !== 'open' || this.state.busy })}${button('Refresh context', 'refresh-case')}</div><p class="poll-note">${this.state.fixtureMode ? 'SIMULATED TRANSCRIPT · fixture only; no microphone, ASR, backend, or message send.' : 'Voice recording starts only after your action. Drafts remain unsent until you approve exact text.'}</p></section>`
   }
 
   private renderVoice(): string {
@@ -1693,9 +1763,13 @@ export class GlanceAppController {
       return `<section class="panel voice-panel"><button class="text-button back-link" data-action="cancel-voice">← Cancel</button><div class="spinner" aria-hidden="true"></div><p class="eyebrow">${phase === 'transcribing' ? 'AUDIO IN MEMORY ONLY' : 'G2 MICROPHONE'}</p><h1>${label}</h1><p class="subtle">${phase === 'transcribing' ? 'No automatic retry. The audio buffer is cleared when this request ends.' : 'Glance will not start recording in the background.'}</p></section>`
     }
     if (phase === 'error') {
-      return `<section class="panel voice-panel"><button class="text-button back-link" data-action="voice-back-case">← Case</button><p class="eyebrow">VOICE CAPTURE</p><h1>Recording stopped</h1><div class="warning-card">${escapeHtml(this.state.voiceError || 'Voice capture could not continue.')}${this.state.requestId ? `<small>Request ID: ${escapeHtml(this.state.requestId)}</small>` : ''}${this.state.retryAfter !== null ? `<small>Try again after ${this.state.retryAfter}s.</small>` : ''}</div><p class="subtle">No recording is retained. Start a new recording to try again.</p>${button('Record again', 'start-voice', { primary: true, disabled: this.state.busy || !this.state.glassesAvailable })}</section>`
+      const retryAction = this.state.voiceSimulation ? 'start-demo-recording' : 'start-voice'
+      const retryLabel = this.state.voiceSimulation ? 'Preview recording again' : 'Record again'
+      return `<section class="panel voice-panel"><button class="text-button back-link" data-action="voice-back-case">← Case</button><p class="eyebrow">VOICE CAPTURE · MICROPHONE OFF</p><h1>Recording stopped</h1><div class="warning-card">${escapeHtml(this.state.voiceError || 'Voice capture could not continue.')}${this.state.requestId ? `<small>Request ID: ${escapeHtml(this.state.requestId)}</small>` : ''}${this.state.retryAfter !== null ? `<small>Try again after ${this.state.retryAfter}s.</small>` : ''}</div><p class="subtle">No recording is retained. You can try again explicitly.</p>${button(retryLabel, retryAction, { primary: true, disabled: this.state.busy || (!this.state.voiceSimulation && !this.state.glassesAvailable) })}</section>`
     }
-    return `<section class="panel voice-panel"><button class="text-button back-link" data-action="voice-back-case">← Case</button><p class="eyebrow">OWNER-STARTED VOICE</p><h1>Ready to record</h1><p class="lead">The G2 microphone opens only after you choose Record. Speak briefly, stop, then review the transcript on your phone.</p>${button('Start G2 recording', 'start-voice', { primary: true, disabled: this.state.busy || !this.state.glassesAvailable || this.state.fixtureMode })}</section>`
+    const startAction = this.state.voiceSimulation ? 'start-demo-recording' : 'start-voice'
+    const startLabel = this.state.voiceSimulation ? 'Start simulated capture' : 'Start G2 recording'
+    return `<section class="panel voice-panel"><button class="text-button back-link" data-action="voice-back-case">← Case</button><p class="eyebrow">${this.state.voiceSimulation ? 'SIMULATED VOICE PREVIEW' : 'OWNER-STARTED VOICE'}</p><h1>Ready to record</h1><p class="lead">${this.state.voiceSimulation ? 'Preview only. No microphone or ASR will run.' : 'The G2 microphone stays off until you choose Start. Speak briefly, stop, then review the transcript on your phone.'}</p>${button(startLabel, startAction, { primary: true, disabled: this.state.busy || (!this.state.voiceSimulation && !this.state.glassesAvailable) })}</section>`
   }
 
   private renderDraft(): string {

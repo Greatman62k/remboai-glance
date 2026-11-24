@@ -85,6 +85,7 @@ test('Even Hub envelope parser distinguishes click, scroll, double-click, and li
   const click = parseEvenHubEvent({ sysEvent: { eventSource: 1 } })
   const explicitZeroClick = parseEvenHubEvent({ textEvent: { containerID: 2, eventType: 0 } })
   const listClick = parseEvenHubEvent({ listEvent: { containerID: 2, currentSelectItemIndex: 0 } })
+  const omittedListZeroClick = parseEvenHubEvent({ listEvent: { containerID: 2 } })
   const selectedDoubleClick = parseEvenHubEvent({
     sysEvent: { eventType: 3, eventSource: 1 },
     listEvent: { containerID: 2, currentSelectItemIndex: 2, currentSelectItemName: 'Kendi' },
@@ -97,6 +98,8 @@ test('Even Hub envelope parser distinguishes click, scroll, double-click, and li
   assert.equal(explicitZeroClick?.kind, 'click')
   assert.equal(listClick?.kind, 'click')
   if (listClick?.kind === 'click') assert.equal(listClick.selectedIndex, 0)
+  assert.equal(omittedListZeroClick?.kind, 'click')
+  if (omittedListZeroClick?.kind === 'click') assert.equal(omittedListZeroClick.selectedIndex, undefined)
   assert.equal(selectedDoubleClick?.kind, 'double_click')
   if (selectedDoubleClick?.kind === 'double_click') {
     assert.equal(selectedDoubleClick.selectedIndex, 2)

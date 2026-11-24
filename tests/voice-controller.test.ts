@@ -3,7 +3,8 @@ import test from 'node:test'
 import { AudioInputSource } from '@evenrealities/even_hub_sdk'
 import { ApiError, type GlanceApi } from '../src/client.ts'
 import { GlanceAppController } from '../src/app.ts'
-import { FIXTURE_CASE_ID } from '../src/demo-fixtures.ts'
+import { DemoFixtures, FIXTURE_CASE_ID } from '../src/demo-fixtures.ts'
+import { parseEvenHubEvent } from '../src/evenhub-events.ts'
 import type { CaseData, DraftData } from '../src/types.ts'
 
 class MemoryStorage {
@@ -67,6 +68,223 @@ function makeApp(api: GlanceApi) {
     restore() { restoreDocument(); restoreSession(); restoreLocal() },
   }
 }
+
+async function startVoiceThroughG2(app: GlanceAppController): Promise<void> {
+  app.state.screen = 'case'
+  app.state.focusedAction = 2
+  await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
+  assert.equal(app.state.screen, 'voice')
+  assert.equal(app.state.voicePhase, 'idle')
+  await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
+}
+
+test('G2 voice-ready stays microphone-off until START and duplicate event paths create one capture', async () => {
+  const { app, restore } = makeApp({ getCase: async () => ({ ...caseData }) } as unknown as GlanceApi)
+  let finishOpen!: (opened: boolean) => void
+  const audioCalls: boolean[] = []
+  app.setGlassesAvailable(true)
+  app.setAudioControl((open) => {
+    audioCalls.push(open)
+    return open ? new Promise<boolean>((resolve) => { finishOpen = resolve }) : Promise.resolve(true)
+  })
+
+  try {
+    app.state.screen = 'case'
+    app.state.focusedAction = 2
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
+    assert.equal(app.state.screen, 'voice')
+    assert.equal(app.state.voicePhase, 'idle')
+    assert.match(app.getGlassText(), /MICROPHONE OFF/)
+    assert.deepEqual(audioCalls, [])
+
+    const activating = app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
+    await Promise.resolve()
+    assert.equal(app.state.voicePhase, 'starting')
+    assert.deepEqual(audioCalls, [true])
+
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'textEvent' })
+    assert.deepEqual(audioCalls, [true])
+    finishOpen(true)
+    await activating
+    assert.equal(app.state.voicePhase, 'recording')
+    assert.match(app.getGlassText(), /RECORDING  \|  MIC ACTIVE/)
+  } finally {
+    await app.dispose()
+    restore()
+  }
+})
+
+test('G2 voice-ready BACK returns to case without opening the microphone', async () => {
+  const { app, restore } = makeApp({ getCase: async () => ({ ...caseData }) } as unknown as GlanceApi)
+  const audioCalls: boolean[] = []
+  app.setAudioControl(async (open) => { audioCalls.push(open); return true })
+  try {
+    app.state.screen = 'case'
+    app.state.focusedAction = 2
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
+    await app.handleGlassesInput({ kind: 'click', source: null, envelope: 'sysEvent' })
+    assert.match(app.getGlassText(), /START  \|  > BACK/)
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
+    assert.equal(app.state.screen, 'case')
+    assert.deepEqual(audioCalls, [])
+  } finally {
+    await app.dispose()
+    restore()
+  }
+})
+
+test('failed G2 microphone activation stays stopped and never renders an active recording state', async () => {
+  const { app, restore } = makeApp({ getCase: async () => ({ ...caseData }) } as unknown as GlanceApi)
+  const audioCalls: boolean[] = []
+  app.setGlassesAvailable(true)
+  app.setAudioControl(async (open) => { audioCalls.push(open); return false })
+  try {
+    app.state.screen = 'case'
+    app.state.focusedAction = 2
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
+
+    assert.deepEqual(audioCalls, [true])
+    assert.equal(app.state.voicePhase, 'error')
+    assert.equal((app as unknown as { voiceCapture: { phase: string; byteLength: number } }).voiceCapture.phase, 'idle')
+    assert.equal((app as unknown as { voiceCapture: { phase: string; byteLength: number } }).voiceCapture.byteLength, 0)
+    assert.match(app.getGlassText(), /CAPTURE STOPPED  \|  MIC OFF/)
+    assert.doesNotMatch(app.getGlassText(), /RECORDING  \|  MIC ACTIVE/)
+  } finally {
+    await app.dispose()
+    restore()
+  }
+})
+
+test('resolve entry resets action 4; cancel returns without resolving and confirm resolves exactly once', async () => {
+  const calls: Array<{ method: string; body?: unknown }> = []
+  const api = {
+    getCase: async () => { calls.push({ method: 'getCase' }); return { ...caseData } },
+    resolveCase: async (_caseId: string, body: unknown) => {
+      calls.push({ method: 'resolveCase', body })
+      return {
+        case_id: caseData.case_id, status: 'resolved' as const, resolved_at: new Date().toISOString(),
+        version: caseData.version + 1, unknown_reply_acknowledged: false, cancelled_reply_ids: [],
+      }
+    },
+  } as unknown as GlanceApi
+  const { app, restore } = makeApp(api)
+  ;(app as unknown as { loadInbox(): Promise<void> }).loadInbox = async () => {}
+
+  try {
+    app.state.screen = 'case'
+    app.state.focusedAction = 4
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
+    assert.equal(app.state.screen, 'resolve')
+    assert.equal(app.state.focusedAction, 0)
+    assert.match(app.getGlassText(), /> CONFIRM RESOLVE  \|  CANCEL/)
+    assert.equal(calls.some((call) => call.method === 'resolveCase'), false)
+
+    await app.handleGlassesInput({ kind: 'click', source: null, envelope: 'sysEvent' })
+    assert.match(app.getGlassText(), /CONFIRM RESOLVE  \|  > CANCEL/)
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
+    assert.equal(app.state.screen, 'case')
+    assert.equal(calls.some((call) => call.method === 'resolveCase'), false)
+
+    app.state.screen = 'case'
+    app.state.focusedAction = 4
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
+    assert.equal(app.state.focusedAction, 0)
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'textEvent' })
+    assert.equal(calls.filter((call) => call.method === 'resolveCase').length, 1)
+    assert.equal(app.state.caseData?.status, 'resolved')
+  } finally {
+    await app.dispose()
+    restore()
+  }
+})
+
+test('invalid resolve action is visibly rejected and cannot resolve a case', async () => {
+  let resolves = 0
+  const api = {
+    resolveCase: async () => {
+      resolves += 1
+      return {
+        case_id: caseData.case_id, status: 'resolved' as const, resolved_at: null,
+        version: caseData.version + 1, unknown_reply_acknowledged: false, cancelled_reply_ids: [],
+      }
+    },
+  } as unknown as GlanceApi
+  const { app, restore } = makeApp(api)
+  try {
+    app.state.screen = 'resolve'
+    app.state.focusedAction = 99
+    ;(app as unknown as { render(): void }).render()
+    assert.match(app.getGlassText(), /ACTION SELECTION INVALID/)
+    assert.doesNotMatch(app.getGlassText(), /> CANCEL/)
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
+    assert.equal(app.state.focusedAction, 0)
+    assert.equal(resolves, 0)
+  } finally {
+    await app.dispose()
+    restore()
+  }
+})
+
+test('single inbox click opens the selected case, root double-click exits to Even Hub, and audio never navigates', async () => {
+  const fixtures = new DemoFixtures()
+  fixtures.startDemo()
+  const calls: string[] = []
+  const api = {
+    getCase: async (caseId: string) => { calls.push(caseId); return fixtures.getCase(caseId) },
+  } as unknown as GlanceApi
+  const { app, restore } = makeApp(api)
+  const exitModes: number[] = []
+  app.setPageShutdownControl(async (exitMode) => { exitModes.push(exitMode); return true })
+  try {
+    app.state.fixtureMode = true
+    app.state.connection = 'development-fixtures'
+    app.state.screen = 'inbox'
+    app.state.inbox = await fixtures.getInbox()
+    app.state.selectedIndex = 0
+
+    const omittedZero = parseEvenHubEvent({ listEvent: { containerID: 2 } })
+    assert.equal(omittedZero?.kind, 'click')
+    if (!omittedZero) throw new Error('Expected a native list click.')
+    await app.handleGlassesInput(omittedZero)
+    assert.equal(app.state.caseData?.customer_label, 'Amina')
+    assert.deepEqual(calls, [app.state.inbox!.items[0].case_id])
+
+    app.state.screen = 'inbox'
+    app.state.selectedIndex = 0
+    const selectedKendi = parseEvenHubEvent({ listEvent: { containerID: 2, currentSelectItemIndex: 2 } })
+    assert.equal(selectedKendi?.kind, 'click')
+    if (!selectedKendi) throw new Error('Expected the selected native list item click.')
+    await app.handleGlassesInput(selectedKendi)
+    assert.equal(app.state.caseData?.customer_label, 'Kendi')
+    assert.equal(calls.at(-1), app.state.inbox!.items[2].case_id)
+
+    const callsBeforeEcho = calls.length
+    const echo = parseEvenHubEvent({ sysEvent: { eventSource: 1 } })
+    if (echo) await app.handleGlassesInput(echo)
+    assert.equal(calls.length, callsBeforeEcho)
+
+    app.state.focusedAction = 5
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
+    assert.equal(app.state.screen, 'inbox')
+    const rootCalls = calls.length
+    ;(app as unknown as { physicalPresses: { clear(): void } }).physicalPresses.clear()
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'listEvent' })
+    assert.equal(app.state.screen, 'inbox')
+    assert.equal(calls.length, rootCalls)
+    assert.deepEqual(exitModes, [1])
+
+    const audio = parseEvenHubEvent({ audioEvent: { source: AudioInputSource.Glasses, audioPcm: new Uint8Array([1, 2]) } })
+    assert.equal(audio?.kind, 'audio')
+    if (audio) await app.handleGlassesInput(audio)
+    assert.equal(app.state.screen, 'inbox')
+    assert.equal(calls.length, rootCalls)
+  } finally {
+    await app.dispose()
+    restore()
+  }
+})
 
 test('voice intent selection uses only its explicit draft endpoint and never sends', async () => {
   const calls: Array<{ method: string; content?: string }> = []
@@ -137,9 +355,8 @@ test('G2 capture is owner-started and microphone closes on backgrounding; sessio
     return true
   })
   try {
-    app.state.screen = 'case'
     app.state.glassesAvailable = true
-    await (app as unknown as { beginVoiceCapture(): Promise<void> }).beginVoiceCapture()
+    await startVoiceThroughG2(app)
     assert.deepEqual(audioCalls[0], { open: true, source: AudioInputSource.Glasses })
     assert.equal(app.state.voicePhase, 'recording')
     await app.handleGlassesInput({ kind: 'audio', source: AudioInputSource.Glasses, pcm: new Uint8Array([1, 2, 3, 4]) })
@@ -180,9 +397,8 @@ test('voice cancellation and leaving transcript review clear transient speech an
   }
 
   try {
-    app.state.screen = 'case'
     app.state.glassesAvailable = true
-    await (app as unknown as { beginVoiceCapture(): Promise<void> }).beginVoiceCapture()
+    await startVoiceThroughG2(app)
     await app.handleGlassesInput({ kind: 'audio', source: AudioInputSource.Glasses, pcm: new Uint8Array([1, 2, 3, 4]) })
     await click('cancel-voice')
     assert.deepEqual(audioCalls, [true, false])
@@ -208,9 +424,8 @@ test('losing the glasses connection while recording closes the microphone and cl
   const audioCalls: boolean[] = []
   app.setAudioControl(async (open) => { audioCalls.push(open); return true })
   try {
-    app.state.screen = 'case'
     app.state.glassesAvailable = true
-    await (app as unknown as { beginVoiceCapture(): Promise<void> }).beginVoiceCapture()
+    await startVoiceThroughG2(app)
     await app.handleGlassesInput({ kind: 'audio', source: AudioInputSource.Glasses, pcm: new Uint8Array([1, 2, 3, 4]) })
 
     app.setGlassesAvailable(false)
@@ -232,9 +447,8 @@ test('disposing the app requests microphone shutdown before the page exit handle
   const audioCalls: boolean[] = []
   app.setAudioControl(async (open) => { audioCalls.push(open); return true })
   try {
-    app.state.screen = 'case'
     app.state.glassesAvailable = true
-    await (app as unknown as { beginVoiceCapture(): Promise<void> }).beginVoiceCapture()
+    await startVoiceThroughG2(app)
     const disposing = app.dispose()
     assert.deepEqual(audioCalls, [true, false])
     await disposing
@@ -268,13 +482,20 @@ test('G2 fixture screens stay glanceable and exact approval remains on the phone
     assert.match(screenText(), /GLANCE DEMO/)
     assert.match(screenText(), /Amina \| OWNER REQUEST/)
     assert.match(screenText(), /Nia \| DEPOSIT QUESTION/)
-    assert.match(screenText(), /SCROLL TO SELECT  \|  DOUBLE TAP OPEN/)
+    assert.match(screenText(), /TAP: OPEN  \|  SWIPE: SELECT/)
 
-    await app.handleGlassesInput({ kind: 'double_click', source: null })
+    await app.handleGlassesInput({ kind: 'click', source: null, envelope: 'listEvent', selectedIndex: 0 })
     assert.equal(app.state.screen, 'case')
     assert.match(screenText(), /CASE DETAIL/)
-    assert.match(screenText(), /LATEST CUSTOMER MESSAGE/)
-    assert.match(screenText(), /I am nearby now/i)
+    assert.match(screenText(), /MSG 1\/5/)
+    assert.match(screenText(), /The owner is checking the request/i)
+    const firstContextPage = screenText()
+    await app.handleGlassesInput({ kind: 'scroll_up', source: null })
+    assert.match(screenText(), /MSG 2\/5/)
+    assert.match(screenText(), /Please let me know when you can/i)
+    assert.notEqual(screenText(), firstContextPage)
+    await app.handleGlassesInput({ kind: 'scroll_down', source: null })
+    assert.equal(screenText(), firstContextPage)
 
     app.state.focusedAction = 0
     render()
@@ -317,9 +538,13 @@ test('G2 fixture screens stay glanceable and exact approval remains on the phone
 
     app.state.caseData = await app.fixtures.getCase(FIXTURE_CASE_ID)
     app.state.screen = 'case'
+    app.state.focusedAction = 2
     const audioControlCalls: boolean[] = []
     app.setAudioControl(async (open) => { audioControlCalls.push(open); return true })
-    await (app as unknown as { beginDemoRecording(): Promise<void> }).beginDemoRecording()
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
+    assert.equal(app.state.voicePhase, 'idle')
+    assert.deepEqual(audioControlCalls, [])
+    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'sysEvent' })
     assert.equal(app.state.screen, 'voice')
     assert.match(screenText(), /SIMULATION  \|  MIC OFF/)
     assert.match(screenText(), /00:00  \/  00:40/)
@@ -372,14 +597,14 @@ test('native inbox list selection survives omitted index zero and opens the sele
       kind: 'scroll_down', source: null, envelope: 'listEvent', selectedIndex: 2,
     })
     assert.equal(app.state.selectedIndex, 2)
-    await app.handleGlassesInput({ kind: 'double_click', source: null, envelope: 'listEvent' })
+    await app.handleGlassesInput({ kind: 'click', source: null, envelope: 'listEvent' })
     assert.equal(app.state.screen, 'case')
     assert.equal(app.state.caseData?.customer_label, 'Kendi')
 
     app.state.screen = 'inbox'
     app.state.selectedIndex = 2
     await app.handleGlassesInput({
-      kind: 'double_click', source: null, envelope: 'listEvent', selectedIndex: 0,
+      kind: 'click', source: null, envelope: 'listEvent', selectedIndex: 0,
     })
     assert.equal(app.state.screen, 'case')
     assert.equal(app.state.caseData?.customer_label, 'Amina')
@@ -519,7 +744,7 @@ test('failed transcription releases captured PCM after the microphone has closed
   try {
     app.state.screen = 'case'
     app.state.glassesAvailable = true
-    await (app as unknown as { beginVoiceCapture(): Promise<void> }).beginVoiceCapture()
+    await startVoiceThroughG2(app)
     await app.handleGlassesInput({ kind: 'audio', source: AudioInputSource.Glasses, pcm: new Uint8Array([9, 8, 7, 6]) })
     await (app as unknown as { stopAndTranscribe(reason: 'owner'): Promise<void> }).stopAndTranscribe('owner')
 

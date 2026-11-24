@@ -53,7 +53,7 @@ In a development build, render the eight synthetic G2 screens by adding `?g2-pre
 evenhub-simulator 'http://127.0.0.1:5173/?g2-preview=voice-recording' --automation-port 9898 --no-glow
 ```
 
-These routes use local synthetic fixtures, skip saved-session loading and backend polling, and never start the microphone. The recording screen is labeled `SIMULATION | MIC OFF`. Scroll navigates cases or list items, click changes the focused action, and double-click activates it. Full transcript review, draft editing, intent selection and exact outgoing-message approval stay on the phone.
+These routes use local synthetic fixtures, skip saved-session loading and backend polling, and never start a real microphone. The simulated `START` action only advances the preview state, with recording labeled `SIMULATION | MIC OFF`. On the inbox, swipe/scroll selects a case and a single click opens it; root-page double-click asks Even Hub to open its exit confirmation. In case detail, scroll moves through bounded context pages (older on scroll-up, newer on scroll-down). Click changes the focused action on other screens and double-click activates it. Full transcript review, draft editing, intent selection and exact outgoing-message approval stay on the phone.
 
 ## Architecture
 

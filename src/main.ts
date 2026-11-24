@@ -88,6 +88,8 @@ async function connectGlasses(): Promise<void> {
       return
     }
 
+    app.setPageShutdownControl((exitMode) => bridge.shutDownPageContainer(exitMode))
+
     let currentPage = initialPage
     let writeFailed = false
     let deviceConnected = true

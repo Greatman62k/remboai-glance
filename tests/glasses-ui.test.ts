@@ -186,6 +186,46 @@ test('open fixture cases remain open until the synthetic resolver confirms them'
   assert.equal(buildGlassesPage(makeState({ screen: 'case', caseData: resolvedCase })).screen, 'case-resolved')
 })
 
+test('case context pages render different bounded events and clamp missing or single-event pages', async () => {
+  const fixtures = new DemoFixtures()
+  fixtures.startDemo()
+  const caseData = await fixtures.getCase(FIXTURE_CASE_ID)
+  const first = buildGlassesPage(makeState({ screen: 'case', caseData, messagePage: 0 }))
+  const middle = buildGlassesPage(makeState({ screen: 'case', caseData, messagePage: 1 }))
+  const older = buildGlassesPage(makeState({ screen: 'case', caseData, messagePage: 2 }))
+  const last = buildGlassesPage(makeState({ screen: 'case', caseData, messagePage: 99 }))
+  const firstText = glassesPageText(first)
+  const middleText = glassesPageText(middle)
+  const olderText = glassesPageText(older)
+  const lastText = glassesPageText(last)
+
+  assert.match(firstText, /MSG 1\/5/)
+  assert.match(firstText, /The owner is checking the request/)
+  assert.match(firstText, /I am nearby now/)
+  assert.match(middleText, /MSG 2\/5/)
+  assert.match(middleText, /Please let me know when you can/)
+  assert.notEqual(firstText, middleText)
+  assert.match(olderText, /MSG 3\/5/)
+  assert.match(olderText, /I can come before five if that works/)
+  assert.match(lastText, /MSG 5\/5  OLDER OMITTED/)
+  assert.match(lastText, /Hello, I wanted to ask about coming/)
+
+  const singleEvent = {
+    ...caseData,
+    has_earlier: false,
+    context: [caseData.context[0]],
+  }
+  const single = glassesPageText(buildGlassesPage(makeState({ screen: 'case', caseData: singleEvent, messagePage: 8 })))
+  assert.match(single, /MSG 1\/1/)
+  assert.match(single, /Hello, I wanted to ask about coming/)
+
+  const empty = glassesPageText(buildGlassesPage(makeState({
+    screen: 'case', caseData: { ...caseData, context: [], has_earlier: false }, messagePage: 8,
+  })))
+  assert.match(empty, /MSG 0\/0/)
+  assert.match(empty, /NO CUSTOMER-VISIBLE MESSAGES/)
+})
+
 test('text updates can reuse stable containers while list and recording geometry changes rebuild', async () => {
   const fixtures = new DemoFixtures()
   fixtures.startDemo()

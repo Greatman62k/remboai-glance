@@ -2,6 +2,7 @@ import type { CaseData, InboxItem, ReplyState } from './types.ts'
 import type { StorageLike } from './session.ts'
 
 export const PENDING_IDEMPOTENCY_STORAGE_KEY = 'remboai-glance.pending-actions.v1'
+export const CONTEXT_PAGE_SIZE = 2
 
 function browserSessionStorage(): StorageLike | null {
   try {
@@ -187,7 +188,7 @@ export function summarizeCase(caseData: CaseData): string {
   return normalized.length > 150 ? `${normalized.slice(0, 147).trimEnd()}…` : normalized
 }
 
-export function messagePage<T>(items: readonly T[], page: number, pageSize = 3): T[] {
+export function messagePage<T>(items: readonly T[], page: number, pageSize = CONTEXT_PAGE_SIZE): T[] {
   const pages = Math.max(1, Math.ceil(items.length / pageSize))
   const safePage = Math.min(Math.max(0, page), pages - 1)
   return items.slice(safePage * pageSize, (safePage + 1) * pageSize)
