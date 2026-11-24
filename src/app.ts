@@ -40,6 +40,7 @@ interface AppState extends AppStateView {
   voiceDurationMs: number
   voiceTranscriptionDurationMs: number | null
   voiceTranscript: string
+  voiceSimulation: boolean
   voiceError: string
 }
 
@@ -89,6 +90,7 @@ const EMPTY_STATE: AppState = {
   voiceDurationMs: 0,
   voiceTranscriptionDurationMs: null,
   voiceTranscript: '',
+  voiceSimulation: false,
   voiceError: '',
 }
 
@@ -238,6 +240,7 @@ export class GlanceAppController {
     this.state.voiceDurationMs = 0
     this.state.voiceTranscriptionDurationMs = null
     this.state.voiceTranscript = ''
+    this.state.voiceSimulation = false
     this.state.voiceError = ''
     this.state.message = 'Starting the G2 microphone…'
     this.state.screen = 'voice'
@@ -344,6 +347,7 @@ export class GlanceAppController {
         const result = await this.api.transcribeAudio(captured.pcm, controller.signal)
         if (generation !== this.voiceGeneration) return
         this.state.voiceTranscript = result.transcript
+        this.state.voiceSimulation = false
         this.state.voiceTranscriptionDurationMs = result.duration_ms
         this.state.voicePhase = 'transcript_ready'
         this.state.voiceError = ''
@@ -411,9 +415,25 @@ export class GlanceAppController {
       const draft = await useTranscriptAsReply(this.api, fresh.case_id, fresh.version, transcript, key)
       this.voiceKeys.complete(scope)
       this.voiceDerivedDraftIds.add(draft.draft_id)
+      await this.clearVoiceWorkflow('')
       this.acceptDraft(draft, true)
       this.state.message = 'Owner-authored draft saved from your transcript. Review and approve the exact text on the phone.'
     }, { keepKeyOnFailure: true, keyScope: scope, keyBook: this.voiceKeys })
+  }
+
+  /** Synthetic-only voice walkthrough. It never opens the microphone or calls the backend. */
+  private showDemoTranscript(): void {
+    if (!this.state.fixtureMode || !this.state.caseData || this.state.caseData.status !== 'open') return
+    this.voiceKeys.clear()
+    this.state.voicePhase = 'transcript_ready'
+    this.state.voiceDurationMs = 6_400
+    this.state.voiceTranscriptionDurationMs = 240
+    this.state.voiceTranscript = 'Please make it shorter and mention walk-ins may be available until 5 p.m.'
+    this.state.voiceSimulation = true
+    this.state.voiceError = ''
+    this.state.message = 'SIMULATED TRANSCRIPT · no microphone, ASR, backend, or customer message was used.'
+    this.state.screen = 'voice'
+    this.render()
   }
 
   private async useVoiceTranscriptAsInstruction(): Promise<void> {
@@ -442,6 +462,7 @@ export class GlanceAppController {
       const next = await useTranscriptAsInstruction(this.api, fresh.case_id, draft.draft_id, fresh.version, transcript, key)
       this.voiceKeys.complete(scope)
       this.voiceDerivedDraftIds.add(next.draft_id)
+      await this.clearVoiceWorkflow('')
       this.acceptDraft(next, false)
       this.state.message = 'Revised AI draft saved. Review and edit the exact customer text on the phone.'
     }, { keepKeyOnFailure: true, keyScope: scope, keyBook: this.voiceKeys })
@@ -484,6 +505,7 @@ export class GlanceAppController {
     this.state.voiceDurationMs = 0
     this.state.voiceTranscriptionDurationMs = null
     this.state.voiceTranscript = ''
+    this.state.voiceSimulation = false
     this.state.voiceError = ''
     if (message) this.state.message = message
     const closed = await this.voiceCapture.cancel()
@@ -573,6 +595,7 @@ export class GlanceAppController {
     this.clearError()
 
     if (action === 'start-demo') return this.startDemo()
+    if (action === 'simulate-voice') return this.showDemoTranscript()
     if (action === 'pair') return this.pair()
     if (action === 'refresh-inbox') return this.loadInbox()
     if (action === 'open-case') return this.openCase(target.dataset.caseId ?? '')
@@ -655,8 +678,7 @@ export class GlanceAppController {
     }
     if (action === 'revoke') return this.revokeCurrentDevice()
     if (action === 'leave-demo') {
-      this.stopDemo()
-      return
+      return this.stopDemo()
     }
     if (action === 'retry-write') return this.retryUncertainAction()
   }
@@ -740,6 +762,7 @@ export class GlanceAppController {
 
   private async startDemo(): Promise<void> {
     if (!DEMO_FIXTURES_ENABLED) return
+    await this.clearVoiceWorkflow('')
     this.sessions.clear()
     this.keys.clear()
     this.fixtures.startDemo()
@@ -755,10 +778,12 @@ export class GlanceAppController {
     this.state.caseData = null
     this.state.draft = null
     this.state.reply = null
+    this.state.replyId = null
     await this.loadInbox()
   }
 
-  private stopDemo(): void {
+  private async stopDemo(): Promise<void> {
+    await this.clearVoiceWorkflow('')
     this.keys.clear()
     this.api = this.liveApi
     this.state.fixtureMode = false
@@ -1384,7 +1409,7 @@ export class GlanceAppController {
         }
         if (selected === 0) return this.generateDraft()
         if (selected === 1) return this.beginManualDraft()
-        if (selected === 2) return this.beginVoiceCapture()
+        if (selected === 2) return this.state.fixtureMode ? this.showDemoTranscript() : this.beginVoiceCapture()
         if (selected === 3) return this.openLatestReply()
         if (selected === 4) { this.state.screen = 'resolve'; this.render(); return }
         break
@@ -1487,7 +1512,10 @@ export class GlanceAppController {
     const latest = item.latest_reply ? `<div class="latest-reply"><span class="eyebrow">LATEST REPLY</span><strong>${escapeHtml(presentReplyState(item.latest_reply.state, item.channel).label)}</strong><button class="text-button" data-action="open-latest-reply">Inspect status →</button></div>` : ''
     const stale = this.state.stale ? '<div class="stale-strip">Case changed · refresh and create a current draft before approval.</div>' : ''
     const thread = events.map((event) => `<article class="message ${escapeHtml(event.actor)}"><div class="message-meta"><strong>${escapeHtml(event.actor === 'customer' ? item.customer_label : event.actor === 'assistant' ? 'RemboAI' : 'Owner')}</strong><time>${escapeHtml(dateTime(event.created_at))}</time></div><p>${escapeHtml(event.text)}</p></article>`).join('')
-    return `<section class="panel case-panel"><button class="text-button back-link" data-action="back-inbox">← Inbox</button><div class="section-heading"><div><p class="eyebrow">${escapeHtml(categoryLabel(item.category))} · ${escapeHtml(item.channel.toUpperCase())}</p><h1>${escapeHtml(item.customer_label)}</h1></div><span class="status-tag ${item.status === 'resolved' ? 'resolved' : ''}">${escapeHtml(caseStatusText(item.status))} · v${item.version}</span></div>${stale}<p class="issue-summary">${escapeHtml(this.caseSummary(item))}</p><div class="context-label"><span>Customer-visible conversation</span>${item.has_earlier ? '<strong>Earlier messages omitted</strong>' : ''}</div><div class="thread-chunk">${thread || '<p class="subtle">No visible conversation is available.</p>'}</div><div class="chunk-nav">${button('Previous messages', 'page-back', { disabled: this.state.messagePage <= 0 })}<span>Chunk ${this.state.messagePage + 1} of ${pages}</span>${button('Next messages', 'page-next', { disabled: this.state.messagePage >= pages - 1 })}</div>${latest}<div class="button-row wrap">${button('Generate AI suggestion', 'generate-draft', { primary: true, disabled: item.status !== 'open' || this.state.busy })}${button('Write a reply', 'write-manually', { disabled: item.status !== 'open' || this.state.busy })}${button('Record voice correction', 'start-voice', { disabled: item.status !== 'open' || this.state.busy || this.state.fixtureMode || !this.state.sessionPresent || !this.state.glassesAvailable })}${button('Resolve case', 'resolve', { disabled: item.status !== 'open' || this.state.busy })}${button('Refresh context', 'refresh-case')}</div><p class="poll-note">Voice recording starts only after your action. Drafts remain unsent until you approve exact text.</p></section>`
+    const voiceAction = this.state.fixtureMode
+      ? button('Simulate voice transcript', 'simulate-voice', { disabled: item.status !== 'open' || this.state.busy })
+      : button('Record voice correction', 'start-voice', { disabled: item.status !== 'open' || this.state.busy || !this.state.sessionPresent || !this.state.glassesAvailable })
+    return `<section class="panel case-panel"><button class="text-button back-link" data-action="back-inbox">← Inbox</button><div class="section-heading"><div><p class="eyebrow">${escapeHtml(categoryLabel(item.category))} · ${escapeHtml(item.channel.toUpperCase())}</p><h1>${escapeHtml(item.customer_label)}</h1></div><span class="status-tag ${item.status === 'resolved' ? 'resolved' : ''}">${escapeHtml(caseStatusText(item.status))} · v${item.version}</span></div>${stale}<p class="issue-summary">${escapeHtml(this.caseSummary(item))}</p><div class="context-label"><span>Customer-visible conversation</span>${item.has_earlier ? '<strong>Earlier messages omitted</strong>' : ''}</div><div class="thread-chunk">${thread || '<p class="subtle">No visible conversation is available.</p>'}</div><div class="chunk-nav">${button('Previous messages', 'page-back', { disabled: this.state.messagePage <= 0 })}<span>Chunk ${this.state.messagePage + 1} of ${pages}</span>${button('Next messages', 'page-next', { disabled: this.state.messagePage >= pages - 1 })}</div>${latest}<div class="button-row wrap">${button('Generate AI suggestion', 'generate-draft', { primary: true, disabled: item.status !== 'open' || this.state.busy })}${button('Write a reply', 'write-manually', { disabled: item.status !== 'open' || this.state.busy })}${voiceAction}${button('Resolve case', 'resolve', { disabled: item.status !== 'open' || this.state.busy })}${button('Refresh context', 'refresh-case')}</div><p class="poll-note">${this.state.fixtureMode ? 'SIMULATED TRANSCRIPT · fixture only; no microphone, ASR, backend, or message send.' : 'Voice recording starts only after your action. Drafts remain unsent until you approve exact text.'}</p></section>`
   }
 
   private renderVoice(): string {
@@ -1508,7 +1536,11 @@ export class GlanceAppController {
           : !canInstruction
             ? 'Refresh the case and keep a current, unedited AI suggestion before using an instruction.'
             : 'This will revise the current AI suggestion only. The transcript is not a customer reply.'
-      return `<section class="panel voice-panel"><button class="text-button back-link" data-action="voice-back-case">← Case</button><p class="eyebrow">TRANSCRIPT · NOT SENT</p><h1>Choose what you meant</h1><div class="voice-facts"><span>Captured ${duration}</span><span>Transcription ${this.state.voiceTranscriptionDurationMs ?? 0} ms</span></div><label for="voice-transcript">Recognized words</label><textarea id="voice-transcript" class="transcript-text" rows="6" readonly>${escapeHtml(this.state.voiceTranscript)}</textarea><div class="intent-cards"><div><h2>Use as reply</h2><p>Create an owner-authored draft from these words. You can edit the full reply before approval.</p>${button('Use as reply', 'use-transcript-reply', { primary: true, disabled: this.state.busy || item.status !== 'open' })}</div><div><h2>Use as instruction</h2><p>${escapeHtml(instructionWhy)}</p>${button('Use as instruction', 'use-transcript-instruction', { disabled: this.state.busy || !canInstruction })}</div></div><p class="subtle">Neither choice sends a message. Exact outgoing text still requires your separate approval.</p>${button('Record again', 'start-voice')}</section>`
+      const transcriptLabel = this.state.voiceSimulation ? 'SIMULATED TRANSCRIPT · FIXTURE ONLY' : 'TRANSCRIPT · NOT SENT'
+      const transcriptNote = this.state.voiceSimulation ? '<p class="warning-card">Synthetic walkthrough text · no microphone or ASR was used. This demo cannot contact customers.</p>' : ''
+      const againAction = this.state.voiceSimulation ? 'simulate-voice' : 'start-voice'
+      const againLabel = this.state.voiceSimulation ? 'Simulate voice transcript again' : 'Record again'
+      return `<section class="panel voice-panel"><button class="text-button back-link" data-action="voice-back-case">← Case</button><p class="eyebrow">${transcriptLabel}</p><h1>Choose what you meant</h1>${transcriptNote}<div class="voice-facts"><span>Captured ${duration}</span><span>${this.state.voiceSimulation ? 'Simulated' : 'Transcription'} ${this.state.voiceTranscriptionDurationMs ?? 0} ms</span></div><label for="voice-transcript">${this.state.voiceSimulation ? 'Synthetic words' : 'Recognized words'}</label><textarea id="voice-transcript" class="transcript-text" rows="6" readonly>${escapeHtml(this.state.voiceTranscript)}</textarea><div class="intent-cards"><div><h2>Use as reply</h2><p>Create an owner-authored draft from these words. You can edit the full reply before approval.</p>${button('Use as reply', 'use-transcript-reply', { primary: true, disabled: this.state.busy || item.status !== 'open' })}</div><div><h2>Use as instruction</h2><p>${escapeHtml(instructionWhy)}</p>${button('Use as instruction', 'use-transcript-instruction', { disabled: this.state.busy || !canInstruction })}</div></div><p class="subtle">Neither choice sends a message. Exact outgoing text still requires your separate approval.</p>${button(againLabel, againAction)}</section>`
     }
     if (phase === 'starting' || phase === 'stopping' || phase === 'transcribing') {
       const label = phase === 'starting' ? 'Starting microphone' : phase === 'stopping' ? 'Stopping microphone' : 'Transcribing'
@@ -1670,7 +1702,7 @@ export class GlanceAppController {
         lines.push('SPEAK · STOP WHEN DONE')
         lines.push(actionLabel(['STOP & TRANSCRIBE', 'CANCEL']))
       } else if (state.voicePhase === 'transcript_ready') {
-        lines.push('TRANSCRIPT READY · NOT SENT')
+        lines.push(state.voiceSimulation ? 'SIMULATED TRANSCRIPT' : 'TRANSCRIPT READY · NOT SENT')
         lines.push(oneLine(state.voiceTranscript))
         lines.push('CHOOSE INTENT ON PHONE')
         lines.push(actionLabel(['OPEN PHONE REVIEW', 'BACK TO CASE']))

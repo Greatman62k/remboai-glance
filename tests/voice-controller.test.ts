@@ -3,6 +3,7 @@ import test from 'node:test'
 import { AudioInputSource } from '@evenrealities/even_hub_sdk'
 import { ApiError, type GlanceApi } from '../src/client.ts'
 import { GlanceAppController } from '../src/app.ts'
+import { FIXTURE_CASE_ID } from '../src/demo-fixtures.ts'
 import type { CaseData, DraftData } from '../src/types.ts'
 
 class MemoryStorage {
@@ -266,6 +267,46 @@ test('G2 voice display stays glanceable and truncates transcript preview for pho
     assert.ok(transcriptLines.includes('CHOOSE INTENT ON PHONE'))
     assert.ok(transcriptLines[2].length <= 27)
     assert.notEqual(transcriptLines[2], app.state.voiceTranscript)
+  } finally {
+    await app.dispose()
+    restore()
+  }
+})
+
+test('development demo labels voice as simulated and keeps explicit choices on fixture APIs', async () => {
+  const api = {} as GlanceApi
+  const { app, local, session, restore } = makeApp(api)
+  try {
+    app.fixtures.startDemo()
+    ;(app as unknown as { api: GlanceApi }).api = app.fixtures
+    app.sessions.clear()
+    app.state.fixtureMode = true
+    app.state.sessionPresent = false
+    app.state.caseData = await app.fixtures.getCase(FIXTURE_CASE_ID)
+    app.state.screen = 'case'
+    ;(app as unknown as { showDemoTranscript(): void }).showDemoTranscript()
+    assert.equal(app.state.voiceSimulation, true)
+    const transcriptScreen = (app as unknown as { renderVoice(): string }).renderVoice()
+    assert.match(transcriptScreen, /SIMULATED TRANSCRIPT · FIXTURE ONLY/)
+    assert.match(transcriptScreen, /no microphone or ASR was used/i)
+
+    const ai = await app.fixtures.createDraft(app.state.caseData!.case_id, app.state.caseData!.version, 'fixture-ai')
+    app.state.draft = ai
+    app.state.editorText = ai.text
+    await (app as unknown as { useVoiceTranscriptAsInstruction(): Promise<void> }).useVoiceTranscriptAsInstruction()
+    assert.equal(app.state.draft?.source, 'ai')
+    assert.equal(app.state.screen, 'draft')
+
+    app.state.screen = 'case'
+    app.state.caseData = await app.fixtures.getCase(app.state.caseData!.case_id)
+    ;(app as unknown as { showDemoTranscript(): void }).showDemoTranscript()
+    await (app as unknown as { useVoiceTranscriptAsReply(): Promise<void> }).useVoiceTranscriptAsReply()
+    assert.equal(app.state.draft?.source, 'owner')
+    assert.equal(app.state.screen, 'draft')
+    assert.equal(app.state.draft?.text, 'Please make it shorter and mention walk-ins may be available until 5 p.m.')
+    assert.equal([...local.values.values(), ...session.values.values()].some((value) => value.includes('walk-ins may be available')), false)
+    assert.equal(app.sessions.load(), null)
+    assert.equal(app.state.fixtureMode, true)
   } finally {
     await app.dispose()
     restore()
