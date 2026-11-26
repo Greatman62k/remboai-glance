@@ -101,6 +101,6 @@ The manifest declares the `g2-microphone` permission. The installed SDK is `@eve
 - No staging hostname or packaged WebView origin has been confirmed. Real HTTPS requests, packaged-app CORS, and production routing have not been verified from the Even Hub WebView.
 - Physical G2 microphone permission and capture, real ASR provider success, packaged WebView CORS, and real HTTPS staging integration remain unverified.
 
-## Repository history
+## License
 
-This is a local-only repository. It has no configured remote and should not be published without an explicit project decision. The initial source snapshot groups the tightly coupled runtime because the entry point, controller, API client, session code, workflow helpers and fixtures are imported together; splitting those existing modules into staged placeholder implementations would create artificial history.
+RemboAI Glance is released under the MIT License. See [LICENSE](LICENSE) for the full text.
