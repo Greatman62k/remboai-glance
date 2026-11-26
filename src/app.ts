@@ -13,16 +13,21 @@ import type {
   ResolveRequest,
 } from './types.ts'
 import type { AppStateView, GlanceScreen } from './state-view.ts'
-import { buildGlassesPage, canCreateDisplaySafeCopy, glassesPageText, G2_MENU, glassesReviewCopy, hasUncertainApproval, needsGlassesReviewCopy, paginateGlassesApprovalText, paginateGlassesText, type GlassesPage } from './glasses-ui.ts'
+import { BODY_LINES, buildGlassesPage, canCreateDisplaySafeCopy, glassesPageText, G2_MENU, glassesReviewCopy, hasUncertainApproval, needsGlassesReviewCopy, paginateGlassesApprovalText, paginateGlassesDisplayText, type GlassesPage } from './glasses-ui.ts'
 import { runtimeMetrics } from './runtime-metrics.ts'
 import { WorkspaceStore, type WorkspaceView } from './workspace.ts'
 import {
   IdempotencyKeyBook,
+  caseAttentionCounts,
+  caseAttentionLabel,
+  caseAttentionTier,
   categoryLabel,
+  channelLabel,
   CONTEXT_PAGE_SIZE,
   messagePage,
   moreCaseCount,
   normalizeOwnerText,
+  prioritizedCaseIndex,
   presentReplyState,
   replyPollDelay,
   shouldPollReply,
@@ -66,12 +71,15 @@ const EMPTY_STATE: AppState = {
   sessionPresent: false,
   salonName: '',
   inbox: null,
+  schedule: null,
+  scheduleOffset: 0,
   inboxStale: false,
   newCaseAvailable: false,
   selectedIndex: 0,
   caseData: null,
   stale: false,
   messagePage: 0,
+  messageTextPage: 0,
   draft: null,
   editorText: '',
   revisionInstruction: '',
@@ -195,7 +203,10 @@ export class GlanceAppController {
       this.render()
       return
     }
-    this.pollTimer = window.setInterval(() => void this.pollVisibleState(), 30_000)
+    // The inbox is the MVP's foreground discovery mechanism. Keep the
+    // interval aligned with the backend workflow contract while still
+    // pausing all work when the app is backgrounded.
+    this.pollTimer = window.setInterval(() => void this.pollVisibleState(), 5_000)
     const session = this.sessions.load()
     if (!session) {
       this.render()
@@ -506,10 +517,10 @@ export class GlanceAppController {
     this.state.transcriptPage = 0
     this.state.voiceDurationMs = 6_400
     this.state.voiceTranscriptionDurationMs = 240
-    this.state.voiceTranscript = 'Please make it shorter and mention walk-ins may be available until 5 p.m.'
+    this.state.voiceTranscript = 'Shorten it and mention walk-ins are accepted until five.'
     this.state.voiceSimulation = true
     this.state.voiceError = ''
-    this.state.message = 'SIMULATED TRANSCRIPT · no microphone, ASR, backend, or customer message was used.'
+    this.state.message = 'Simulated transcript · no microphone, ASR, backend, or customer message was used.'
     this.state.screen = 'voice'
     this.render()
   }
@@ -523,7 +534,7 @@ export class GlanceAppController {
     this.state.voiceSimulation = true
     this.state.voiceDurationMs = 0
     this.state.voiceTranscript = ''
-    this.state.message = 'SIMULATED CAPTURE · microphone and ASR are off.'
+    this.state.message = 'Simulated capture · microphone and ASR are off.'
     this.demoCaptureStartedAt = Date.now()
     this.state.screen = 'voice'
     this.render()
@@ -545,10 +556,10 @@ export class GlanceAppController {
     this.state.focusedAction = 0
     this.state.transcriptPage = 0
     this.state.voiceTranscriptionDurationMs = null
-    this.state.voiceTranscript = 'Please make it shorter and mention walk-ins may be available until 5 p.m.'
+    this.state.voiceTranscript = 'Shorten it and mention walk-ins are accepted until five.'
     this.state.voiceSimulation = true
     this.state.voiceError = ''
-    this.state.message = 'SIMULATED TRANSCRIPT · no microphone, ASR, backend, or customer message was used.'
+    this.state.message = 'Simulated transcript · no microphone, ASR, backend, or customer message was used.'
     this.render()
   }
 
@@ -722,17 +733,37 @@ export class GlanceAppController {
           this.state.selectedIndex = (this.state.selectedIndex + delta + count) % count
         }
       } else if (this.state.screen === 'case' && this.state.caseData) {
-        const pages = Math.ceil(this.state.caseData.context.length / CONTEXT_PAGE_SIZE)
-        const lastPage = Math.max(0, pages - 1)
-        const currentPage = Number.isFinite(this.state.messagePage) ? Math.floor(this.state.messagePage) : 0
-        const pageDelta = input.kind === 'scroll_up' ? 1 : -1
-        this.state.messagePage = Math.min(lastPage, Math.max(0, currentPage + pageDelta))
+        const context = this.state.caseData.context
+        const pageCount = Math.ceil(context.length / CONTEXT_PAGE_SIZE)
+        const lastPage = Math.max(0, pageCount - 1)
+        const currentPage = Math.min(lastPage, Math.max(0, Math.floor(this.state.messagePage) || 0))
+        const chronologicalPage = pageCount > 0 ? pageCount - 1 - currentPage : 0
+        const currentMessage = messagePage(context, chronologicalPage, CONTEXT_PAGE_SIZE)[0]
+        const messageText = currentMessage
+          ? currentMessage.actor === 'customer' ? currentMessage.text
+            : `(${currentMessage.actor === 'assistant' ? 'RemboAI' : 'Owner'}) ${currentMessage.text}`
+          : ''
+        const textPages = paginateGlassesDisplayText(messageText)
+        const lastTextPage = Math.max(0, textPages.length - 1)
+        const currentTextPage = Math.min(lastTextPage, Math.max(0, Math.floor(this.state.messageTextPage ?? 0)))
+        if (input.kind === 'scroll_up') {
+          if (currentTextPage < lastTextPage) this.state.messageTextPage = currentTextPage + 1
+          else if (currentPage < lastPage) {
+            this.state.messagePage = currentPage + 1
+            this.state.messageTextPage = 0
+          }
+        } else if (currentTextPage > 0) {
+          this.state.messageTextPage = currentTextPage - 1
+        } else if (currentPage > 0) {
+          this.state.messagePage = currentPage - 1
+          this.state.messageTextPage = 0
+        }
       } else if (this.state.screen === 'draft') {
-        const pages = paginateGlassesText(this.state.editorText || this.state.draft?.text || '')
+        const pages = paginateGlassesDisplayText(this.state.editorText || this.state.draft?.text || '', BODY_LINES)
         const delta = input.kind === 'scroll_down' ? 1 : -1
         this.state.draftPage = Math.min(pages.length - 1, Math.max(0, this.state.draftPage + delta))
       } else if (this.state.screen === 'voice' && this.state.voicePhase === 'transcript_ready') {
-        const pages = paginateGlassesText(this.state.voiceTranscript, 46, 3)
+        const pages = paginateGlassesDisplayText(this.state.voiceTranscript, BODY_LINES)
         const delta = input.kind === 'scroll_down' ? 1 : -1
         this.state.transcriptPage = Math.min(pages.length - 1, Math.max(0, this.state.transcriptPage + delta))
       } else if (this.state.screen === 'approval') {
@@ -820,6 +851,13 @@ export class GlanceAppController {
     }
     if (action === 'pair') return this.pair()
     if (action === 'refresh-inbox') return this.loadInbox()
+    if (action === 'show-schedule' || action === 'refresh-schedule') return this.loadSchedule(0)
+    if (action === 'schedule-next') {
+      const next = this.state.schedule?.next_offset
+      if (next !== null && next !== undefined) return this.loadSchedule(next)
+      return
+    }
+    if (action === 'schedule-previous') return this.loadSchedule(Math.max(0, this.state.scheduleOffset - 20))
     if (action === 'open-case') return this.openCase(target.dataset.caseId ?? '')
     if (action === 'open-selected') {
       const item = this.state.inbox?.items[this.state.selectedIndex]
@@ -997,6 +1035,8 @@ export class GlanceAppController {
     this.state.message = 'Development fixtures only. No backend was contacted and no message can be sent.'
     this.state.error = ''
     this.state.inbox = null
+    this.state.schedule = null
+    this.state.scheduleOffset = 0
     this.state.caseData = null
     this.state.draft = null
     this.state.reply = null
@@ -1011,6 +1051,8 @@ export class GlanceAppController {
     this.state.sessionPresent = false
     this.state.salonName = ''
     this.state.inbox = null
+    this.state.schedule = null
+    this.state.scheduleOffset = 0
     this.state.caseData = null
     this.state.draft = null
     this.state.reply = null
@@ -1032,6 +1074,7 @@ export class GlanceAppController {
       if (controller.signal.aborted) return
       const hadInbox = Boolean(this.state.inbox)
       const previousCaseIds = new Set(this.state.inbox?.items.map((item) => item.case_id) ?? [])
+      const previousSelectedId = this.state.inbox?.items[this.state.selectedIndex]?.case_id
       const eligibleItems = sortInboxOldestFirst(inbox.items.filter((item) => item.status === 'open'))
       const hasNewVisibleCase = eligibleItems.some((item) => !previousCaseIds.has(item.case_id))
       inbox.items = eligibleItems.slice(0, 20)
@@ -1039,7 +1082,14 @@ export class GlanceAppController {
       this.state.inboxStale = false
       this.state.newCaseAvailable = this.state.newCaseAvailable || (hadInbox && hasNewVisibleCase)
       this.state.connection = this.state.fixtureMode ? 'development-fixtures' : 'connected'
-      this.state.selectedIndex = Math.min(this.state.selectedIndex, Math.max(0, inbox.items.length - 1))
+      const stillSelectedIndex = previousSelectedId
+        ? inbox.items.findIndex((item) => item.case_id === previousSelectedId)
+        : -1
+      this.state.selectedIndex = stillSelectedIndex >= 0
+        ? stillSelectedIndex
+        : hadInbox
+          ? Math.min(this.state.selectedIndex, Math.max(0, inbox.items.length - 1))
+          : prioritizedCaseIndex(inbox.items)
       this.state.error = ''
       this.state.message = this.state.fixtureMode
         ? 'Synthetic records · local demo only · no customer message is sent.'
@@ -1056,6 +1106,23 @@ export class GlanceAppController {
     }
   }
 
+  private async loadSchedule(offset = 0): Promise<void> {
+    if (this.state.busy) return
+    const requestedOffset = Math.max(0, Math.min(1000, Math.floor(offset)))
+    await this.withBusy('schedule', async () => {
+      const schedule = await this.api.getSchedule(20, requestedOffset)
+      this.state.schedule = schedule
+      this.state.scheduleOffset = requestedOffset
+      this.state.screen = 'schedule'
+      this.state.focusedAction = 0
+      this.state.connection = this.state.fixtureMode ? 'development-fixtures' : 'connected'
+      this.clearError()
+      this.state.message = this.state.fixtureMode
+        ? 'Synthetic schedule · local demo only · no customer message is sent.'
+        : ''
+    })
+  }
+
   private async restoreWorkspace(): Promise<void> {
     if (this.state.fixtureMode || !this.state.sessionPresent) return
     const saved = this.workspace.load()
@@ -1064,6 +1131,7 @@ export class GlanceAppController {
       const fresh = await this.api.getCase(saved.case_id)
       this.state.caseData = fresh
       this.state.messagePage = 0
+      this.state.messageTextPage = 0
       this.state.draftPage = 0
       this.state.stale = Boolean(saved.draft && saved.draft.based_on_version !== fresh.version)
       // Expired drafts remain available for display and for replaying an
@@ -1161,6 +1229,7 @@ export class GlanceAppController {
       this.state.caseData = data
       this.state.newCaseAvailable = false
       this.state.messagePage = 0
+      this.state.messageTextPage = 0
       this.state.draftPage = 0
       this.state.transcriptPage = 0
       this.state.stale = false
@@ -1750,6 +1819,8 @@ export class GlanceAppController {
     this.state.salonName = ''
     this.state.message = 'Session ended. Pair this device again through Telegram.'
     this.state.inbox = null
+    this.state.schedule = null
+    this.state.scheduleOffset = 0
     this.state.caseData = null
     this.state.draft = null
     this.state.editorText = ''
@@ -1787,6 +1858,7 @@ export class GlanceAppController {
     }
     this.restorePendingVoiceIntent()
     if (this.state.screen === 'inbox') await this.loadInbox()
+    else if (this.state.screen === 'schedule') await this.loadSchedule(this.state.scheduleOffset)
     else if (this.state.caseData && ['case', 'voice', 'draft', 'approval', 'resolve', 'status'].includes(this.state.screen)) {
       await this.refreshCaseStatus()
       if (this.state.screen === 'status' && this.state.replyId) await this.fetchReply(this.state.replyId, true, true)
@@ -1832,6 +1904,8 @@ export class GlanceAppController {
     this.state.salonName = ''
     this.state.message = 'Session expired. Pair this device again through Telegram.'
     this.state.inbox = null
+    this.state.schedule = null
+    this.state.scheduleOffset = 0
     this.state.caseData = null
     this.state.draft = null
     this.state.editorText = ''
@@ -1939,6 +2013,18 @@ export class GlanceAppController {
           }
         }
         return
+      case 'schedule': {
+        const hasPrevious = this.state.scheduleOffset > 0
+        const hasNext = Boolean(this.state.schedule?.has_more)
+        if (hasPrevious && selected === 0) return this.loadSchedule(this.state.scheduleOffset - 20)
+        const nextIndex = hasPrevious ? 1 : 0
+        if (hasNext && selected === nextIndex) {
+          const next = this.state.schedule?.next_offset
+          if (next !== null && next !== undefined) return this.loadSchedule(next)
+        }
+        this.returnToInbox()
+        return
+      }
       case 'case':
         if (this.state.caseData?.status === 'resolved') {
           if (selected === 0 && this.state.caseData.latest_reply) return this.openLatestReply()
@@ -2037,6 +2123,7 @@ export class GlanceAppController {
         ? 3 : (this.canApproveFromGlasses() ? 2 : 1)
       case 'status': return 3
       case 'resolve': return 2
+      case 'schedule': return 1 + (this.state.scheduleOffset > 0 ? 1 : 0) + (this.state.schedule?.has_more ? 1 : 0)
       default: return 1
     }
   }
@@ -2105,6 +2192,20 @@ export class GlanceAppController {
   }
 
   private async activateGlassMenuItem(itemId: number): Promise<void> {
+    if (itemId === G2_MENU.caseRefresh && this.state.screen === 'case') {
+      await this.refreshCase(true)
+      return
+    }
+    if (itemId === G2_MENU.scheduleToday && this.state.screen === 'inbox') return this.loadSchedule(0)
+    if (itemId === G2_MENU.schedulePrevious && this.state.screen === 'schedule') {
+      return this.loadSchedule(Math.max(0, this.state.scheduleOffset - 20))
+    }
+    if (itemId === G2_MENU.scheduleNext && this.state.screen === 'schedule') {
+      const next = this.state.schedule?.next_offset
+      if (next !== null && next !== undefined) return this.loadSchedule(next)
+      return
+    }
+    if (itemId === G2_MENU.scheduleInbox && this.state.screen === 'schedule') return this.returnToInbox()
     if (itemId === G2_MENU.inboxOpen) {
       if (this.state.inbox?.items.length) await this.openSelectedInboxCase()
       else await this.loadInbox()
@@ -2185,35 +2286,62 @@ export class GlanceAppController {
 
   private renderScreen(): string {
     const fixtureBanner = this.state.fixtureMode
-      ? '<div class="fixture-banner" role="note"><strong>DEVELOPMENT FIXTURES · SYNTHETIC ONLY</strong><span>No backend request · no customer message can be sent</span></div>'
+      ? '<div class="fixture-banner" role="note"><strong>Development fixtures · synthetic only</strong><span>No backend request · no customer message can be sent</span></div>'
       : ''
-    const header = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span><strong>RemboAI</strong><small>GLANCE</small></span></div><div class="top-meta"><span class="connection ${escapeHtml(this.state.connection)}">${escapeHtml(this.connectionLabel())}</span>${this.state.sessionPresent || this.state.fixtureMode ? `<span class="salon-name">${escapeHtml(this.state.salonName)}</span>` : ''}</div></header>`
+    const header = `<header class="topbar"><div class="brand"><span class="brand-mark">R</span><span><strong>RemboAI</strong><small>Glance</small></span></div><div class="top-meta"><span class="connection ${escapeHtml(this.state.connection)}">${escapeHtml(this.connectionLabel())}</span>${this.state.sessionPresent || this.state.fixtureMode ? `<span class="salon-name">${escapeHtml(this.state.salonName)}</span>` : ''}</div></header>`
     const footer = `<footer class="app-footer"><span>${this.state.glassesAvailable ? 'G2 connected · 576 × 288' : escapeHtml(this.state.glassesStatus)}</span>${this.state.sessionPresent && !this.state.fixtureMode ? button('Revoke this device', 'revoke') : this.state.fixtureMode ? button('Exit demo', 'leave-demo') : ''}</footer>`
     const error = this.state.error ? `<div class="error-card" role="alert"><strong>${escapeHtml(this.state.error)}</strong>${this.state.requestId ? `<small>Request ID: ${escapeHtml(this.state.requestId)}</small>` : ''}${this.state.retryAfter !== null ? `<small>Retry after ${this.state.retryAfter}s</small>` : ''}${this.canRetrySameAction() ? button('Retry the same request', 'retry-write', { primary: true }) : ''}</div>` : ''
     const message = formMessage(this.state.message)
     const screen = this.state.screen === 'pair' ? this.renderPair() :
       this.state.screen === 'inbox' ? this.renderInbox() :
+      this.state.screen === 'schedule' ? this.renderSchedule() :
       this.state.screen === 'case' ? this.renderCase() :
       this.state.screen === 'voice' ? this.renderVoice() :
       this.state.screen === 'draft' ? this.renderDraft() :
       this.state.screen === 'approval' ? this.renderApproval() :
       this.state.screen === 'status' ? this.renderStatus() : this.renderResolve()
-    return `${fixtureBanner}${header}<main class="layout"><section class="phone-shell"><div class="phone-screen">${screen}${error}${message}</div></section><aside class="glance-hint"><p class="eyebrow">GLASSES FIRST</p><h2>Handle escalations on G2.</h2><p>Swipe to browse or page. Click highlights an action; double-click activates it. The inbox opens a selected case on one click.</p><div class="control-key"><span>SWIPE</span><b>Browse / page</b></div><div class="control-key"><span>CLICK</span><b>Choose action</b></div><div class="control-key"><span>DOUBLE</span><b>Confirm action</b></div><p class="hint-small">Pairing, recovery and optional full-text editing are available here. The ordinary reply and approval flow stays on the glasses.</p></aside></main>${footer}`
+    return `${fixtureBanner}${header}<main class="layout"><section class="phone-shell"><div class="phone-screen">${screen}${error}${message}</div></section><aside class="glance-hint"><p class="eyebrow">Glasses first</p><h2>Handle escalations on G2.</h2><p>Swipe to browse or page. Click highlights an action; double-click activates it. The inbox opens a selected case on one click.</p><div class="control-key"><span>Swipe</span><b>Browse / page</b></div><div class="control-key"><span>Click</span><b>Choose action</b></div><div class="control-key"><span>Double</span><b>Confirm action</b></div><p class="hint-small">Pairing, recovery and optional full-text editing are available here. The ordinary reply and approval flow stays on the glasses.</p></aside></main>${footer}`
   }
 
   private renderPair(): string {
     const allowFixtures = DEMO_FIXTURES_ENABLED
-    return `<section class="panel pair-panel"><p class="eyebrow">OWNER ESCALATION DESK</p><h1>Pair your Glance</h1><p class="lead">Open the RemboAI Glance pairing message in your authenticated Telegram owner chat, then enter its 12-character code here.</p><p class="bridge-notice">${this.state.glassesAvailable ? 'Even Hub display connected · 576 × 288' : escapeHtml(this.state.glassesStatus)}</p><form data-form="pair" class="stack"><label for="pair-code">One-time pairing code</label><input id="pair-code" name="code" inputmode="text" autocomplete="one-time-code" autocapitalize="characters" maxlength="12" placeholder="0123456789AB" value="${escapeHtml(this.state.code)}" data-field="code" aria-describedby="pair-help" required><small id="pair-help">Letters use Crockford Base32. Spaces and hyphens are ignored. The code expires in five minutes.</small><button class="button primary wide" type="submit" ${this.state.busy ? 'disabled' : ''}>${this.state.busy ? 'Pairing…' : 'Pair this device'}</button></form><div class="privacy-note"><strong>Revocable bearer session</strong><span>The session token is stored in browser localStorage. Revoke it here or from the Telegram owner chat. Do not share this device.</span></div>${allowFixtures ? `<div class="demo-entry"><span>For layout and workflow review only</span>${button('Open synthetic development demo', 'start-demo')}</div>` : ''}</section>`
+    return `<section class="panel pair-panel"><p class="eyebrow">Owner escalation desk</p><h1>Pair your Glance</h1><p class="lead">Open the RemboAI Glance pairing message in your authenticated Telegram owner chat, then enter its 12-character code here.</p><p class="bridge-notice">${this.state.glassesAvailable ? 'Even Hub display connected · 576 × 288' : escapeHtml(this.state.glassesStatus)}</p><form data-form="pair" class="stack"><label for="pair-code">One-time pairing code</label><input id="pair-code" name="code" inputmode="text" autocomplete="one-time-code" autocapitalize="characters" maxlength="12" placeholder="0123456789AB" value="${escapeHtml(this.state.code)}" data-field="code" aria-describedby="pair-help" required><small id="pair-help">Letters use Crockford Base32. Spaces and hyphens are ignored. The code expires in five minutes.</small><button class="button primary wide" type="submit" ${this.state.busy ? 'disabled' : ''}>${this.state.busy ? 'Pairing…' : 'Pair this device'}</button></form><div class="privacy-note"><strong>Revocable bearer session</strong><span>The session token is stored in browser localStorage. Revoke it here or from the Telegram owner chat. Do not share this device.</span></div>${allowFixtures ? `<div class="demo-entry"><span>For layout and workflow review only</span>${button('Open synthetic development demo', 'start-demo')}</div>` : ''}</section>`
   }
 
   private renderInbox(): string {
     const inbox = this.state.inbox
     const items = inbox?.items ?? []
     const stale = this.state.inboxStale ? '<div class="stale-strip">Offline · showing stale in-memory cases</div>' : ''
-    const list = items.length ? `<div class="case-list">${items.map((item, index) => `<article class="case-row ${index === this.state.selectedIndex ? 'selected' : ''}"><button class="case-open" data-action="open-case" data-case-id="${escapeHtml(item.case_id)}"><span class="customer">${escapeHtml(item.customer_label)}</span><span class="case-age">${escapeHtml(this.age(item.created_at))}</span><span class="case-category">${escapeHtml(categoryLabel(item.category))} · ${escapeHtml(item.channel.toUpperCase())}</span><span class="preview">${escapeHtml(item.preview)}</span><span class="open-chevron">Open →</span></button></article>`).join('')}</div>` : `<div class="empty-state"><div class="empty-icon">✓</div><h2>${this.state.connection === 'loading' ? 'Loading your inbox' : 'You are all caught up'}</h2><p>${this.state.connection === 'loading' ? 'Checking for open owner escalations.' : 'No open cases need your attention right now.'}</p></div>`
+    const list = items.length ? `<div class="case-list">${items.map((item, index) => {
+      const tier = caseAttentionTier(item.category)
+      return `<article class="case-row priority-${tier} ${index === this.state.selectedIndex ? 'selected' : ''}"><button class="case-open" data-action="open-case" data-case-id="${escapeHtml(item.case_id)}"><span class="case-main"><span class="customer">${escapeHtml(item.customer_label)}</span><span class="case-age">${escapeHtml(this.age(item.created_at))} waiting</span></span><span class="case-subtitle"><span class="priority-badge ${tier}">${escapeHtml(caseAttentionLabel(item.category))}</span><span class="case-category">${escapeHtml(categoryLabel(item.category))}</span><span class="case-channel">${escapeHtml(channelLabel(item.channel))}</span></span><span class="preview">${escapeHtml(item.preview)}</span><span class="open-chevron">Open case →</span></button></article>`
+    }).join('')}</div>` : `<div class="empty-state"><div class="empty-icon">✓</div><h2>${this.state.connection === 'loading' ? 'Loading your inbox' : 'You are all caught up'}</h2><p>${this.state.connection === 'loading' ? 'Checking for open owner escalations.' : 'No open cases need your attention right now.'}</p></div>`
+    const attention = caseAttentionCounts(items)
+    const reviewCount = attention.review ? `${attention.review} ${attention.review === 1 ? 'case needs' : 'cases need'} review` : ''
+    const attentionSummary = items.length ? `<div class="case-priority-summary" aria-label="Case priority summary"><strong>Needs attention</strong>${attention.urgent ? `<span class="priority-badge urgent">${attention.urgent} urgent</span>` : ''}${attention.sensitive ? `<span class="priority-badge sensitive">${attention.sensitive} sensitive</span>` : ''}${reviewCount ? `<span class="priority-badge review">${reviewCount}</span>` : ''}<small>${inbox?.has_more ? 'among shown cases' : 'across open cases'}</small></div>` : ''
     const count = inbox ? inbox.open_count : '—'
     const more = inbox?.has_more ? `<p class="more-note">Showing ${items.length} oldest open cases · ${moreCaseCount(inbox.open_count, items.length)} more not shown.</p>` : ''
-    return `<section class="panel inbox-panel"><div class="section-heading"><div><p class="eyebrow">${this.state.fixtureMode ? 'SYNTHETIC INBOX' : 'OWNER INBOX'}</p><h1>Open cases</h1></div><div class="count-pill"><strong>${escapeHtml(count)}</strong><span>open</span></div></div>${stale}${list}${more}<div class="button-row">${button('Refresh', 'refresh-inbox')}${items.length ? button('Open selected case', 'open-selected', { primary: true }) : ''}</div><p class="poll-note">Inbox checks every 30 seconds while visible. New cases may take time to appear.</p></section>`
+    return `<section class="panel inbox-panel"><div class="section-heading"><div><p class="eyebrow">${this.state.fixtureMode ? 'Synthetic inbox' : 'Owner inbox'}</p><h1>Open cases</h1></div><div class="count-pill"><strong>${escapeHtml(count)}</strong><span>open</span></div></div>${stale}${attentionSummary}${list}${more}<div class="button-row">${button('Refresh', 'refresh-inbox')}${button('Today\'s schedule', 'show-schedule')}${items.length ? button('Open selected case', 'open-selected', { primary: true }) : ''}</div><p class="poll-note">Inbox checks every 5 seconds while visible. New cases may take time to appear.</p></section>`
+  }
+
+  private renderSchedule(): string {
+    const schedule = this.state.schedule
+    if (!schedule) return this.renderLoading('Loading today\'s schedule')
+    const items = schedule.items
+    const format = (iso: string): string => {
+      const value = new Date(iso)
+      if (!Number.isFinite(value.getTime())) return '--:--'
+      try {
+        return new Intl.DateTimeFormat(undefined, {
+          hour: '2-digit', minute: '2-digit', hour12: false, timeZone: schedule.timezone,
+        }).format(value)
+      } catch {
+        return new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', hour12: false }).format(value)
+      }
+    }
+    const rows = items.map((item) => `<article class="schedule-row"><div><strong>${escapeHtml(format(item.starts_at))} · ${escapeHtml(item.service)}</strong><span>${escapeHtml(item.staff)} · ${escapeHtml(item.customer_label)}</span></div><small>${escapeHtml(item.payment_state.replaceAll('_', ' '))}</small></article>`).join('')
+    const page = `${this.state.scheduleOffset / 20 + 1}${schedule.has_more ? '+' : ''}`
+    return `<section class="panel schedule-panel"><button class="text-button back-link" data-action="back-inbox">← Inbox</button><div class="section-heading"><div><p class="eyebrow">Owner program · ${escapeHtml(schedule.date)}</p><h1>Today\'s schedule</h1></div><div class="count-pill"><strong>${escapeHtml(schedule.count)}</strong><span>shown</span></div></div>${items.length ? `<div class="schedule-list">${rows}</div>` : '<div class="empty-state"><div class="empty-icon">✓</div><h2>No active bookings</h2><p>Your program is clear for this day.</p></div>'}<div class="button-row">${this.state.scheduleOffset > 0 ? button('Previous', 'schedule-previous') : ''}${schedule.has_more ? button('Next', 'schedule-next') : ''}${button('Back to inbox', 'back-inbox', { primary: true })}</div><p class="poll-note">Read-only schedule · page ${escapeHtml(page)} · payment labels never include amounts or evidence.</p></section>`
   }
 
   private renderCase(): string {
@@ -2224,13 +2352,13 @@ export class GlanceAppController {
       ? Math.min(pages - 1, Math.max(0, Math.floor(this.state.messagePage)))
       : 0
     const events = messagePage(item.context, pages - 1 - pageNumber, CONTEXT_PAGE_SIZE)
-    const latest = item.latest_reply ? `<div class="latest-reply"><span class="eyebrow">LATEST REPLY</span><strong>${escapeHtml(presentReplyState(item.latest_reply.state, item.channel).label)}</strong><button class="text-button" data-action="open-latest-reply">Inspect status →</button></div>` : ''
+    const latest = item.latest_reply ? `<div class="latest-reply"><span class="eyebrow">Latest reply</span><strong>${escapeHtml(presentReplyState(item.latest_reply.state, item.channel).label)}</strong><button class="text-button" data-action="open-latest-reply">Inspect status →</button></div>` : ''
     const stale = this.state.stale ? '<div class="stale-strip">Case changed · refresh and create a current draft before approval.</div>' : ''
     const thread = events.map((event) => `<article class="message ${escapeHtml(event.actor)}"><div class="message-meta"><strong>${escapeHtml(event.actor === 'customer' ? item.customer_label : event.actor === 'assistant' ? 'RemboAI' : 'Owner')}</strong><time>${escapeHtml(dateTime(event.created_at))}</time></div><p>${escapeHtml(event.text)}</p></article>`).join('')
     const voiceAction = this.state.fixtureMode
       ? button('Open simulated voice controls', 'open-voice-ready', { disabled: item.status !== 'open' || this.state.busy })
       : button('Record voice correction', 'start-voice', { disabled: item.status !== 'open' || this.state.busy || !this.state.sessionPresent || !this.state.glassesAvailable })
-    return `<section class="panel case-panel"><button class="text-button back-link" data-action="back-inbox">← Inbox</button><div class="section-heading"><div><p class="eyebrow">${escapeHtml(categoryLabel(item.category))} · ${escapeHtml(item.channel.toUpperCase())}</p><h1>${escapeHtml(item.customer_label)}</h1></div><span class="status-tag ${item.status === 'resolved' ? 'resolved' : ''}">${escapeHtml(caseStatusText(item.status))} · v${item.version}</span></div>${stale}<p class="issue-summary">${escapeHtml(this.caseSummary(item))}</p><div class="context-label"><span>Customer-visible conversation</span>${item.has_earlier ? '<strong>Earlier messages omitted</strong>' : ''}</div><div class="thread-chunk">${thread || '<p class="subtle">No visible conversation is available.</p>'}</div><div class="chunk-nav">${button('Previous messages', 'page-back', { disabled: pageNumber >= pages - 1 })}<span>Chunk ${pageNumber + 1} of ${pages} · newest first</span>${button('Next messages', 'page-next', { disabled: pageNumber <= 0 })}</div>${latest}<div class="button-row wrap">${button('Generate AI suggestion', 'generate-draft', { primary: true, disabled: item.status !== 'open' || this.state.busy })}${button('Write a reply', 'write-manually', { disabled: item.status !== 'open' || this.state.busy })}${voiceAction}${button('Resolve case', 'resolve', { disabled: item.status !== 'open' || this.state.busy })}${button('Refresh context', 'refresh-case')}</div><p class="poll-note">${this.state.fixtureMode ? 'SIMULATED TRANSCRIPT · fixture only; no microphone, ASR, backend, or message send.' : 'Voice recording starts only after your action. Drafts remain unsent until you approve exact text.'}</p></section>`
+    return `<section class="panel case-panel"><button class="text-button back-link" data-action="back-inbox">← Inbox</button><div class="section-heading"><div><p class="eyebrow">${escapeHtml(caseAttentionLabel(item.category))} · ${escapeHtml(categoryLabel(item.category))} · ${escapeHtml(channelLabel(item.channel))}</p><h1>${escapeHtml(item.customer_label)}</h1></div><span class="status-tag ${item.status === 'resolved' ? 'resolved' : ''}">${escapeHtml(caseStatusText(item.status))} · v${item.version}</span></div>${stale}<p class="issue-summary"><strong>Latest customer message</strong><span>${escapeHtml(this.caseSummary(item))}</span></p><div class="context-label"><span>Customer-visible conversation</span>${item.has_earlier ? '<strong>Earlier messages omitted</strong>' : ''}</div><div class="thread-chunk">${thread || '<p class="subtle">No visible conversation is available.</p>'}</div><div class="chunk-nav">${button('Previous messages', 'page-back', { disabled: pageNumber >= pages - 1 })}<span>Chunk ${pageNumber + 1} of ${pages} · newest first</span>${button('Next messages', 'page-next', { disabled: pageNumber <= 0 })}</div>${latest}<div class="button-row wrap">${button('Generate AI suggestion', 'generate-draft', { primary: true, disabled: item.status !== 'open' || this.state.busy })}${button('Write a reply', 'write-manually', { disabled: item.status !== 'open' || this.state.busy })}${voiceAction}${button('Resolve case', 'resolve', { disabled: item.status !== 'open' || this.state.busy })}${button('Refresh context', 'refresh-case')}</div><p class="poll-note">${this.state.fixtureMode ? 'Simulated transcript · fixture only; no microphone, ASR, backend, or message send.' : 'Voice recording starts only after your action. Drafts remain unsent until you approve exact text.'}</p></section>`
   }
 
   private renderVoice(): string {
@@ -2240,7 +2368,7 @@ export class GlanceAppController {
     const duration = this.formatDuration(this.state.voiceDurationMs)
     if (phase === 'recording') {
       const simulated = this.state.voiceSimulation
-      return `<section class="panel voice-panel"><button class="text-button back-link" data-action="cancel-voice">← Cancel voice workflow</button><p class="eyebrow">${simulated ? 'SIMULATED CAPTURE · MIC OFF' : 'G2 MICROPHONE ACTIVE'}</p><h1>${simulated ? 'Capture preview' : 'Recording'}</h1><div class="recording-indicator ${simulated ? 'simulated-recording' : ''}"><span class="recording-dot"></span><strong>${simulated ? 'Simulation only' : 'Microphone on'}</strong><span class="voice-duration">${duration}</span></div><p class="lead">${simulated ? 'Fixture-only display preview. No microphone or ASR is running.' : 'Speak a short message. Stop when you are done. The recording stays in memory and is not saved.'}</p><div class="button-row">${button(simulated ? 'Finish simulated capture' : 'Stop and transcribe', 'stop-voice', { primary: true })}${button('Cancel', 'cancel-voice')}</div><small>${simulated ? 'Synthetic fixture · no audio is captured' : 'Maximum 40 seconds · G2 microphone only'}</small></section>`
+      return `<section class="panel voice-panel"><button class="text-button back-link" data-action="cancel-voice">← Cancel voice workflow</button><p class="eyebrow">${simulated ? 'Simulated capture · mic off' : 'G2 microphone active'}</p><h1>${simulated ? 'Capture preview' : 'Recording'}</h1><div class="recording-indicator ${simulated ? 'simulated-recording' : ''}"><span class="recording-dot"></span><strong>${simulated ? 'Simulation only' : 'Microphone on'}</strong><span class="voice-duration">${duration}</span></div><p class="lead">${simulated ? 'Fixture-only display preview. No microphone or ASR is running.' : 'Speak a short message. Stop when you are done. The recording stays in memory and is not saved.'}</p><div class="button-row">${button(simulated ? 'Finish simulated capture' : 'Stop and transcribe', 'stop-voice', { primary: true })}${button('Cancel', 'cancel-voice')}</div><small>${simulated ? 'Synthetic fixture · no audio is captured' : 'Maximum 40 seconds · G2 microphone only'}</small></section>`
     }
     if (phase === 'transcript_ready') {
       const draft = this.state.draft
@@ -2252,7 +2380,7 @@ export class GlanceAppController {
           : !canInstruction
             ? 'Refresh the case and keep a current, unedited AI suggestion before using an instruction.'
             : 'This will revise the current AI suggestion only. The transcript is not a customer reply.'
-      const transcriptLabel = this.state.voiceSimulation ? 'SIMULATED TRANSCRIPT · FIXTURE ONLY' : 'TRANSCRIPT · NOT SENT'
+      const transcriptLabel = this.state.voiceSimulation ? 'Simulated transcript · fixture only' : 'Transcript · not sent'
       const transcriptNote = this.state.voiceSimulation ? '<p class="warning-card">Synthetic walkthrough text · no microphone or ASR was used. This demo cannot contact customers.</p>' : ''
       const againAction = this.state.voiceSimulation ? 'start-demo-recording' : 'start-voice'
       const againLabel = this.state.voiceSimulation ? 'Start simulated capture again' : 'Record again'
@@ -2260,28 +2388,28 @@ export class GlanceAppController {
     }
     if (phase === 'starting' || phase === 'stopping' || phase === 'transcribing') {
       const label = phase === 'starting' ? 'Starting microphone' : phase === 'stopping' ? 'Stopping microphone' : 'Transcribing'
-      return `<section class="panel voice-panel"><button class="text-button back-link" data-action="cancel-voice">← Cancel</button><div class="spinner" aria-hidden="true"></div><p class="eyebrow">${phase === 'transcribing' ? 'AUDIO IN MEMORY ONLY' : 'G2 MICROPHONE'}</p><h1>${label}</h1><p class="subtle">${phase === 'transcribing' ? 'No automatic retry. The audio buffer is cleared when this request ends.' : 'Glance will not start recording in the background.'}</p></section>`
+      return `<section class="panel voice-panel"><button class="text-button back-link" data-action="cancel-voice">← Cancel</button><div class="spinner" aria-hidden="true"></div><p class="eyebrow">${phase === 'transcribing' ? 'Audio in memory only' : 'G2 microphone'}</p><h1>${label}</h1><p class="subtle">${phase === 'transcribing' ? 'No automatic retry. The audio buffer is cleared when this request ends.' : 'Glance will not start recording in the background.'}</p></section>`
     }
     if (phase === 'error') {
       const retryAction = this.state.voiceSimulation ? 'start-demo-recording' : 'start-voice'
       const retryLabel = this.state.voiceSimulation ? 'Preview recording again' : 'Record again'
-      return `<section class="panel voice-panel"><button class="text-button back-link" data-action="voice-back-case">← Case</button><p class="eyebrow">VOICE CAPTURE · MICROPHONE OFF</p><h1>Recording stopped</h1><div class="warning-card">${escapeHtml(this.state.voiceError || 'Voice capture could not continue.')}${this.state.requestId ? `<small>Request ID: ${escapeHtml(this.state.requestId)}</small>` : ''}${this.state.retryAfter !== null ? `<small>Try again after ${this.state.retryAfter}s.</small>` : ''}</div><p class="subtle">No recording is retained. You can try again explicitly.</p>${button(retryLabel, retryAction, { primary: true, disabled: this.state.busy || (!this.state.voiceSimulation && !this.state.glassesAvailable) })}</section>`
+      return `<section class="panel voice-panel"><button class="text-button back-link" data-action="voice-back-case">← Case</button><p class="eyebrow">Voice capture · microphone off</p><h1>Recording stopped</h1><div class="warning-card">${escapeHtml(this.state.voiceError || 'Voice capture could not continue.')}${this.state.requestId ? `<small>Request ID: ${escapeHtml(this.state.requestId)}</small>` : ''}${this.state.retryAfter !== null ? `<small>Try again after ${this.state.retryAfter}s.</small>` : ''}</div><p class="subtle">No recording is retained. You can try again explicitly.</p>${button(retryLabel, retryAction, { primary: true, disabled: this.state.busy || (!this.state.voiceSimulation && !this.state.glassesAvailable) })}</section>`
     }
     const startAction = this.state.voiceSimulation ? 'start-demo-recording' : 'start-voice'
     const startLabel = this.state.voiceSimulation ? 'Start simulated capture' : 'Start G2 recording'
-    return `<section class="panel voice-panel"><button class="text-button back-link" data-action="voice-back-case">← Case</button><p class="eyebrow">${this.state.voiceSimulation ? 'SIMULATED VOICE PREVIEW' : 'OWNER-STARTED VOICE'}</p><h1>Ready to record</h1><p class="lead">${this.state.voiceSimulation ? 'Preview only. No microphone or ASR will run.' : 'The G2 microphone stays off until you choose Start. Speak briefly, stop, then choose a reply or revision instruction on the glasses.'}</p>${button(startLabel, startAction, { primary: true, disabled: this.state.busy || (!this.state.voiceSimulation && !this.state.glassesAvailable) })}</section>`
+    return `<section class="panel voice-panel"><button class="text-button back-link" data-action="voice-back-case">← Case</button><p class="eyebrow">${this.state.voiceSimulation ? 'Simulated voice preview' : 'Owner-started voice'}</p><h1>Ready to record</h1><p class="lead">${this.state.voiceSimulation ? 'Preview only. No microphone or ASR will run.' : 'The G2 microphone stays off until you choose Start. Speak briefly, stop, then choose a reply or revision instruction on the glasses.'}</p>${button(startLabel, startAction, { primary: true, disabled: this.state.busy || (!this.state.voiceSimulation && !this.state.glassesAvailable) })}</section>`
   }
 
   private renderDraft(): string {
     const draft = this.state.draft
     if (!this.state.caseData) return this.renderLoading('Loading case')
     if (this.state.manualMode && !draft) {
-      return `<section class="panel editor-panel"><button class="text-button back-link" data-action="back-case">← Case</button><p class="eyebrow">OWNER-AUTHORED REPLY</p><h1>Write a reply</h1><p class="lead">This text will be saved as a manual draft. It will not be sent until you inspect and approve the exact text.</p><form data-form="manual-draft" class="stack"><label for="reply-editor">Customer-facing text <span class="counter">${[...this.state.editorText].length}/700</span></label><textarea id="reply-editor" data-field="editorText" maxlength="700" rows="8" placeholder="Write the reply you want the customer to receive.">${escapeHtml(this.state.editorText)}</textarea><button class="button primary wide" type="submit" ${this.state.busy ? 'disabled' : ''}>${this.state.busy ? 'Saving draft…' : 'Save manual draft'}</button></form>${this.uncertainNote('manual-draft')}</section>`
+      return `<section class="panel editor-panel"><button class="text-button back-link" data-action="back-case">← Case</button><p class="eyebrow">Owner-authored reply</p><h1>Write a reply</h1><p class="lead">This text will be saved as a manual draft. It will not be sent until you inspect and approve the exact text.</p><form data-form="manual-draft" class="stack"><label for="reply-editor">Customer-facing text <span class="counter">${[...this.state.editorText].length}/700</span></label><textarea id="reply-editor" data-field="editorText" maxlength="700" rows="8" placeholder="Write the reply you want the customer to receive.">${escapeHtml(this.state.editorText)}</textarea><button class="button primary wide" type="submit" ${this.state.busy ? 'disabled' : ''}>${this.state.busy ? 'Saving draft…' : 'Save manual draft'}</button></form>${this.uncertainNote('manual-draft')}</section>`
     }
     if (!draft) return this.renderLoading(this.state.busy ? 'Creating AI suggestion' : 'No saved draft')
     const expiry = new Date(draft.expires_at)
     const isExpired = !Number.isFinite(expiry.getTime()) || expiry.getTime() <= Date.now()
-    const source = this.state.fixtureMode ? 'SYNTHETIC PREVIEW — NOT AI / NOT SENT' : draft.source === 'ai' ? 'AI SUGGESTION — NOT SENT' : 'OWNER-AUTHORED DRAFT — NOT SENT'
+    const source = this.state.fixtureMode ? 'Synthetic preview — not AI / not sent' : draft.source === 'ai' ? 'AI suggestion — not sent' : 'Owner-authored draft — not sent'
     const revision = draft.source === 'ai' ? `<form data-form="revise" class="stack revision-form"><label for="revision">Owner correction instruction <span class="counter">${[...this.state.revisionInstruction].length}/300</span></label><textarea id="revision" data-field="revisionInstruction" maxlength="300" rows="3" placeholder="Tell the assistant what to change. This instruction is not the customer reply.">${escapeHtml(this.state.revisionInstruction)}</textarea><button class="button" type="submit" ${this.state.busy ? 'disabled' : ''}>${this.state.busy ? 'Revising…' : 'Create revised draft'}</button></form>` : ''
     return `<section class="panel editor-panel"><button class="text-button back-link" data-action="back-case">← Case</button><p class="eyebrow">${source}</p><h1>Review your draft</h1><div class="draft-meta"><span>Case version ${draft.based_on_version}</span><span>${isExpired ? 'Expired' : `Expires ${escapeHtml(dateTime(draft.expires_at))}`}</span></div>${this.state.stale || draft.based_on_version !== this.state.caseData.version ? '<div class="stale-strip">This draft is stale. Refresh context and create a new draft before approval.</div>' : ''}<label for="draft-editor">Full customer-facing reply <span class="counter">${[...this.state.editorText].length}/700</span></label><textarea id="draft-editor" data-field="editorText" maxlength="700" rows="9" ${isExpired ? 'disabled' : ''}>${escapeHtml(this.state.editorText)}</textarea><p class="subtle">Editing this text changes only the proposed reply. Nothing is sent automatically.</p>${revision}<div class="button-row wrap">${button('Review exact text', 'open-approval', { primary: true, disabled: isExpired || this.state.stale || this.state.busy })}${draft.source === 'ai' ? button('Save as owner-authored draft', 'save-owner-copy', { disabled: isExpired || this.state.busy }) : ''}${button('Back to case', 'back-case')}</div>${this.uncertainNote(draft.source === 'ai' ? 'ai-draft' : 'manual-draft')}</section>`
   }
@@ -2291,19 +2419,19 @@ export class GlanceAppController {
     if (!draft) return this.renderLoading('No persisted draft')
     const unresolvedWarning = this.state.caseData?.latest_reply && ['queued', 'sending', 'unknown'].includes(this.state.caseData.latest_reply.state)
       ? '<div class="warning-card"><strong>Existing reply needs attention.</strong><span>Inspect its status before approving another message.</span></div>' : ''
-    return `<section class="panel approval-panel"><button class="text-button back-link" data-action="back-draft">← Draft</button><p class="eyebrow">EXACT TEXT · NOT SENT</p><h1>Inspect the full reply</h1><p class="lead">Read every line below. This exact text will be queued if you approve.</p><label for="approval-editor">Customer-facing message</label><textarea id="approval-editor" data-field="approvalText" maxlength="1000" rows="12">${escapeHtml(this.state.approvalText)}</textarea><label class="check-row"><input type="checkbox" data-field="reviewedExactText" ${this.state.reviewedExactText ? 'checked' : ''}><span>I reviewed the complete exact customer message above.</span></label>${unresolvedWarning}<div class="button-row">${button('Approve and queue', 'approve', { primary: true, disabled: !this.state.reviewedExactText || this.state.busy || Boolean(unresolvedWarning) })}${button('Cancel', 'cancel-approval')}</div><p class="subtle">Approval creates a queued reply. It does not confirm provider acceptance or customer delivery.</p>${this.uncertainNote('approval')}${button('Check if a reply was already queued', 'recover-reply')}</section>`
+    return `<section class="panel approval-panel"><button class="text-button back-link" data-action="back-draft">← Draft</button><p class="eyebrow">Exact text · not sent</p><h1>Inspect the full reply</h1><p class="lead">Read every line below. This exact text will be queued if you approve.</p><label for="approval-editor">Customer-facing message</label><textarea id="approval-editor" data-field="approvalText" maxlength="1000" rows="12">${escapeHtml(this.state.approvalText)}</textarea><label class="check-row"><input type="checkbox" data-field="reviewedExactText" ${this.state.reviewedExactText ? 'checked' : ''}><span>I reviewed the complete exact customer message above.</span></label>${unresolvedWarning}<div class="button-row">${button('Approve and queue', 'approve', { primary: true, disabled: !this.state.reviewedExactText || this.state.busy || Boolean(unresolvedWarning) })}${button('Cancel', 'cancel-approval')}</div><p class="subtle">Approval creates a queued reply. It does not confirm provider acceptance or customer delivery.</p>${this.uncertainNote('approval')}${button('Check if a reply was already queued', 'recover-reply')}</section>`
   }
 
   private renderStatus(): string {
     const reply = this.state.reply
     const latest = this.state.caseData?.latest_reply
     const channel = this.state.caseData?.channel ?? 'telegram'
-    if (!reply && latest) return `<section class="panel status-panel"><button class="text-button back-link" data-action="back-case">← Case</button><p class="eyebrow">REPLY RECOVERY</p><h1>Checking latest reply</h1><p class="lead">The case shows a reply. Fetching its current status.</p>${button('Check status', 'open-latest-reply', { primary: true })}</section>`
-    if (!reply) return `<section class="panel status-panel"><button class="text-button back-link" data-action="back-case">← Case</button><p class="eyebrow">REPLY STATUS</p><h1>No reply status loaded</h1>${button('Recover from case', 'recover-reply', { primary: true })}</section>`
+    if (!reply && latest) return `<section class="panel status-panel"><button class="text-button back-link" data-action="back-case">← Case</button><p class="eyebrow">Reply recovery</p><h1>Checking latest reply</h1><p class="lead">The case shows a reply. Fetching its current status.</p>${button('Check status', 'open-latest-reply', { primary: true })}</section>`
+    if (!reply) return `<section class="panel status-panel"><button class="text-button back-link" data-action="back-case">← Case</button><p class="eyebrow">Reply status</p><h1>No reply status loaded</h1>${button('Recover from case', 'recover-reply', { primary: true })}</section>`
     const presentation = presentReplyState(reply.state, channel)
     const statusClass = reply.state === 'failed' || reply.state === 'unknown' ? 'danger' : reply.state === 'delivered' ? 'success' : ''
     const action = shouldPollReply(reply.state) ? 'Sending is still in progress. Status checks slow down and stop automatically.' : 'No automatic delivery claim is made.'
-    return `<section class="panel status-panel"><button class="text-button back-link" data-action="back-case">← Case</button><p class="eyebrow">${this.state.fixtureMode ? 'SYNTHETIC REPLY' : 'OUTBOUND REPLY'}</p><h1>Reply status</h1><div class="reply-state ${statusClass}"><span class="state-dot"></span><strong>${escapeHtml(presentation.label)}</strong></div><p class="lead">${escapeHtml(presentation.detail)}</p><dl class="status-facts"><div><dt>Updated</dt><dd>${escapeHtml(dateTime(reply.updated_at))}</dd></div><div><dt>Reply ID</dt><dd class="id-value">${escapeHtml(reply.reply_id)}</dd></div>${reply.error_category ? `<div><dt>Issue</dt><dd>${escapeHtml(reply.error_category.replaceAll('_', ' '))}</dd></div>` : ''}</dl><p class="subtle">${escapeHtml(action)}</p><div class="button-row wrap">${button('Check status', 'check-status', { primary: true })}${button('Resolve case', 'resolve', { disabled: this.state.caseData?.status === 'resolved' })}${button('Inbox', 'back-inbox')}</div></section>`
+    return `<section class="panel status-panel"><button class="text-button back-link" data-action="back-case">← Case</button><p class="eyebrow">${this.state.fixtureMode ? 'Synthetic reply' : 'Outbound reply'}</p><h1>Reply status</h1><div class="reply-state ${statusClass}"><span class="state-dot"></span><strong>${escapeHtml(presentation.label)}</strong></div><p class="lead">${escapeHtml(presentation.detail)}</p><dl class="status-facts"><div><dt>Updated</dt><dd>${escapeHtml(dateTime(reply.updated_at))}</dd></div><div><dt>Reply ID</dt><dd class="id-value">${escapeHtml(reply.reply_id)}</dd></div>${reply.error_category ? `<div><dt>Issue</dt><dd>${escapeHtml(reply.error_category.replaceAll('_', ' '))}</dd></div>` : ''}</dl><p class="subtle">${escapeHtml(action)}</p><div class="button-row wrap">${button('Check status', 'check-status', { primary: true })}${button('Resolve case', 'resolve', { disabled: this.state.caseData?.status === 'resolved' })}${button('Inbox', 'back-inbox')}</div></section>`
   }
 
   private renderResolve(): string {
@@ -2314,7 +2442,7 @@ export class GlanceAppController {
     const queued = item.latest_reply?.state === 'queued' ? '<p class="subtle">Resolving will cancel the queued reply before dispatch. It will not be sent.</p>' : ''
     const sending = item.latest_reply?.state === 'sending' ? '<div class="warning-card"><strong>Reply is sending.</strong><span>Wait for its outcome before resolving.</span></div>' : ''
     const resolved = item.status === 'resolved'
-    return `<section class="panel resolve-panel"><button class="text-button back-link" data-action="back-case">← Case</button><p class="eyebrow">OWNER ACTION</p><h1>${resolved ? 'Case resolved' : 'Resolve this case?'}</h1><p class="lead">Resolving records that you have closed this escalation. Sending a reply and resolving the case are separate actions.</p>${warning}${queued}${sending}${resolved ? '<div class="success-card">This case is marked resolved. Payment status is unchanged.</div>' : `<form data-form="resolve" class="stack"><label for="resolve-reason">Reason</label><select id="resolve-reason" data-field="resolveReason">${REASONS.map((reason) => `<option value="${reason.value}" ${reason.value === this.state.resolveReason ? 'selected' : ''}>${reason.label}</option>`).join('')}</select>${this.state.resolveReason === 'other' ? `<label for="resolve-note">Short note (optional)</label><textarea id="resolve-note" data-field="resolveNote" maxlength="200" rows="3">${escapeHtml(this.state.resolveNote)}</textarea>` : ''}<div class="button-row"><button class="button primary" type="submit" ${this.state.busy || Boolean(sending) || (unknown && !this.state.acknowledgedUnknown) ? 'disabled' : ''}>${this.state.busy ? 'Resolving…' : 'Confirm resolution'}</button>${button('Cancel', 'cancel-resolve')}</div></form>`}</section>`
+    return `<section class="panel resolve-panel"><button class="text-button back-link" data-action="back-case">← Case</button><p class="eyebrow">Owner action</p><h1>${resolved ? 'Case resolved' : 'Resolve this case?'}</h1><p class="lead">Resolving records that you have closed this escalation. Sending a reply and resolving the case are separate actions.</p>${warning}${queued}${sending}${resolved ? '<div class="success-card">This case is marked resolved. Payment status is unchanged.</div>' : `<form data-form="resolve" class="stack"><label for="resolve-reason">Reason</label><select id="resolve-reason" data-field="resolveReason">${REASONS.map((reason) => `<option value="${reason.value}" ${reason.value === this.state.resolveReason ? 'selected' : ''}>${reason.label}</option>`).join('')}</select>${this.state.resolveReason === 'other' ? `<label for="resolve-note">Short note (optional)</label><textarea id="resolve-note" data-field="resolveNote" maxlength="200" rows="3">${escapeHtml(this.state.resolveNote)}</textarea>` : ''}<div class="button-row"><button class="button primary" type="submit" ${this.state.busy || Boolean(sending) || (unknown && !this.state.acknowledgedUnknown) ? 'disabled' : ''}>${this.state.busy ? 'Resolving…' : 'Confirm resolution'}</button>${button('Cancel', 'cancel-resolve')}</div></form>`}</section>`
   }
 
   private renderLoading(title: string): string {

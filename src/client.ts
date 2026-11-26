@@ -2,6 +2,7 @@ import { SessionStore } from './session.ts'
 import type {
   ApiEnvelope,
   ApiErrorEnvelope,
+  AttentionData,
   CaseData,
   CaseStatusData,
   DraftData,
@@ -10,6 +11,7 @@ import type {
   ReplyResult,
   ResolveRequest,
   ResolveResult,
+  ScheduleData,
   SessionData,
   TranscriptionData,
 } from './types.ts'
@@ -33,6 +35,8 @@ export interface GlanceApi {
   exchangePairing(code: string, deviceLabel: string, signal?: AbortSignal): Promise<SessionData>
   revokeCurrentSession(signal?: AbortSignal): Promise<void>
   getInbox(signal?: AbortSignal, polling?: boolean): Promise<InboxData>
+  getAttention(limit?: number, signal?: AbortSignal, polling?: boolean): Promise<AttentionData>
+  getSchedule(limit?: number, offset?: number, signal?: AbortSignal, polling?: boolean): Promise<ScheduleData>
   getCase(caseId: string, signal?: AbortSignal): Promise<CaseData>
   getCaseStatus(caseId: string, signal?: AbortSignal, polling?: boolean): Promise<CaseStatusData>
   createDraft(caseId: string, expectedVersion: number, key: string, signal?: AbortSignal): Promise<DraftData>
@@ -164,6 +168,21 @@ export class GlanceApiClient {
 
   getInbox(signal?: AbortSignal, polling = false): Promise<InboxData> {
     return this.request<InboxData>('GET', '/inbox?limit=20', { signal, polling })
+  }
+
+  getAttention(limit = 50, signal?: AbortSignal, polling = false): Promise<AttentionData> {
+    const boundedLimit = Math.min(50, Math.max(1, Math.floor(limit)))
+    return this.request<AttentionData>('GET', `/attention?limit=${boundedLimit}`, { signal, polling })
+  }
+
+  getSchedule(limit = 20, offset = 0, signal?: AbortSignal, polling = false): Promise<ScheduleData> {
+    const boundedLimit = Math.min(50, Math.max(1, Math.floor(limit)))
+    const boundedOffset = Math.min(1000, Math.max(0, Math.floor(offset)))
+    return this.request<ScheduleData>(
+      'GET',
+      `/schedule?limit=${boundedLimit}&offset=${boundedOffset}`,
+      { signal, polling },
+    )
   }
 
   getCase(caseId: string, signal?: AbortSignal): Promise<CaseData> {

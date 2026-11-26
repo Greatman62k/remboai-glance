@@ -6,10 +6,14 @@ import { parseEvenHubEvent, PhysicalPressDeduplicator } from '../src/evenhub-eve
 import {
   IdempotencyKeyBook,
   caseIsStale,
+  caseAttentionCounts,
+  caseAttentionLabel,
+  caseAttentionTier,
   messagePage,
   moreCaseCount,
   normalizeOwnerText,
   presentReplyState,
+  prioritizedCaseIndex,
   replyPollDelay,
   shouldPollReply,
   sortInboxOldestFirst,
@@ -27,6 +31,22 @@ test('inbox ordering, more count, fixed context chunks, and version stale checks
   assert.deepEqual(messagePage([0, 1, 2, 3, 4, 5, 6], 2, 3), [6])
   assert.equal(caseIsStale({ version: 4 } as never, 5), true)
   assert.equal(caseIsStale({ version: 4 } as never, 4), false)
+})
+
+test('case attention hierarchy is clear and selects the highest-risk visible case without reordering', () => {
+  const items = [
+    { case_id: 'routine', category: 'human_request' },
+    { case_id: 'sensitive', category: 'complaint' },
+    { case_id: 'urgent', category: 'emergency' },
+    { case_id: 'also-urgent', category: 'emergency' },
+  ] as never[]
+  assert.equal(caseAttentionTier(items[0].category), 'review')
+  assert.equal(caseAttentionLabel(items[1].category), 'Sensitive')
+  assert.equal(caseAttentionLabel(items[2].category), 'Urgent')
+  assert.deepEqual(caseAttentionCounts(items), { urgent: 2, sensitive: 1, review: 1 })
+  assert.equal(prioritizedCaseIndex(items), 2)
+  assert.equal(prioritizedCaseIndex([]), 0)
+  assert.deepEqual(items.map((item) => item.case_id), ['routine', 'sensitive', 'urgent', 'also-urgent'])
 })
 
 test('owner text normalization enforces length and strips only surrounding whitespace', () => {

@@ -6,6 +6,7 @@ import { paginateGlassesApprovalText } from './glasses-ui.ts'
 
 export type G2PreviewName =
   | 'inbox'
+  | 'schedule'
   | 'case'
   | 'case-older'
   | 'draft'
@@ -20,6 +21,7 @@ export type G2PreviewName =
 
 const ROUTES: G2PreviewName[] = [
   'inbox',
+  'schedule',
   'case',
   'case-older',
   'draft',
@@ -45,11 +47,14 @@ export async function prepareG2Preview(app: GlanceAppController, route: G2Previe
   app.state.sessionPresent = false
   app.state.salonName = 'Synthetic cases'
   app.state.inbox = await app.fixtures.getInbox()
+  app.state.schedule = await app.fixtures.getSchedule()
+  app.state.scheduleOffset = 0
   app.state.inboxStale = false
   app.state.selectedIndex = 0
   app.state.caseData = await app.fixtures.getCase(FIXTURE_CASE_ID)
   app.state.stale = false
   app.state.messagePage = 0
+  app.state.messageTextPage = 0
   app.state.focusedAction = 0
   app.state.draft = null
   app.state.editorText = ''
@@ -66,6 +71,9 @@ export async function prepareG2Preview(app: GlanceAppController, route: G2Previe
   switch (route) {
     case 'inbox':
       app.state.screen = 'inbox'
+      break
+    case 'schedule':
+      app.state.screen = 'schedule'
       break
     case 'case':
       app.state.screen = 'case'
@@ -89,7 +97,7 @@ export async function prepareG2Preview(app: GlanceAppController, route: G2Previe
         app.state.caseData.version,
         'g2-approval-preview',
       )
-      app.state.editorText = "Thanks for asking. I will check today's availability with the team and confirm what we can offer. I do not want to promise a time until they verify the current schedule. I will send you an update as soon as I have a reliable answer."
+      app.state.editorText = "Yes, walk-ins are accepted until 5:00 p.m. this afternoon. Please come before then and our team will help you as soon as a chair is available. There may be a short wait while we finish with the clients already here. If you can share your expected arrival time, we can let the team know and be ready to assist. We look forward to seeing you and will confirm any changes as soon as possible."
       app.state.approvalText = app.state.editorText
       app.state.screen = 'approval'
       app.state.approvalStage = route === 'approval-confirm' ? 'confirm' : 'review'
@@ -97,6 +105,11 @@ export async function prepareG2Preview(app: GlanceAppController, route: G2Previe
         ? paginateGlassesApprovalText(app.state.approvalText).length - 1
         : 0
       app.state.approvalPage = 0
+      // The direct preview route represents a review that has already been
+      // persisted. Seed the controller's private review snapshot so the final
+      // confirmation action exercises the same approval guard as the live flow.
+      ;(app as unknown as { approvalSnapshot: string; approvalDraftSnapshot: string }).approvalSnapshot = app.state.approvalText
+      ;(app as unknown as { approvalSnapshot: string; approvalDraftSnapshot: string }).approvalDraftSnapshot = app.state.draft.draft_id
       break
     }
     case 'voice-ready':
@@ -109,7 +122,7 @@ export async function prepareG2Preview(app: GlanceAppController, route: G2Previe
       break
     case 'transcript-preview':
       app.state.voicePhase = 'transcript_ready'
-      app.state.voiceTranscript = 'The owner can confirm whether walk-ins are available this afternoon.'
+      app.state.voiceTranscript = 'Shorten it and mention walk-ins are accepted until five.'
       app.state.voiceDurationMs = 8_000
       app.state.screen = 'voice'
       break

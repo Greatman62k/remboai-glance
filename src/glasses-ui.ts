@@ -6,11 +6,11 @@ import {
   TextContainerProperty,
 } from '@evenrealities/even_hub_sdk'
 import type { AppStateView } from './state-view.ts'
-import { categoryLabel, CONTEXT_PAGE_SIZE, messagePage, presentReplyState } from './workflow.ts'
+import { caseAttentionLabel, caseAttentionTier, categoryLabel, channelLabel, CONTEXT_PAGE_SIZE, messagePage, presentReplyState } from './workflow.ts'
 import { canUseTranscriptAsInstruction } from './voice-intents.ts'
 
 export type GlassesScreenId =
-  | 'pair' | 'inbox' | 'case' | 'draft' | 'voice-ready' | 'voice-recording'
+  | 'pair' | 'inbox' | 'schedule' | 'case' | 'draft' | 'voice-ready' | 'voice-recording'
   | 'transcript-preview' | 'reply-status' | 'case-resolved' | 'resolve' | 'loading'
 
 export interface GlassesState extends AppStateView {
@@ -25,6 +25,8 @@ export interface GlassesState extends AppStateView {
   glassesStatus: string
   busyAction: string
   acknowledgedUnknown: boolean
+  /** Long-message chunk within the selected context event. */
+  messageTextPage?: number
 }
 
 export interface GlassesPage {
@@ -38,17 +40,63 @@ export interface GlassesPage {
 
 const SAFE_X = 24
 const SAFE_WIDTH = 528
-const LINE_CHARS = 52
-const REVIEW_LINES = 5
-export const APPROVAL_LINES_PER_PAGE = 3
+export const CHARS_PER_LINE = 52
+export const HEADER_CHARS = 52
+export const LIST_ROW_CHARS = 52
+export const FOOT_LEFT_X = SAFE_X
+export const FOOT_LEFT_WIDTH = 318
+export const FOOT_LEFT_CHARS = 30
+export const FOOT_RIGHT_X = 342
+export const FOOT_RIGHT_WIDTH = 210
+export const FOOT_RIGHT_CHARS = 20
+export const REVIEW_LINES = 5
+// Kept as an alias for the controller's existing display-pagination import.
+export const BODY_LINES = REVIEW_LINES
+export const APPROVAL_LINES_PER_PAGE = REVIEW_LINES
+export const TEXT_HEADER = 3
+export const TEXT_BODY = 4
+export const TEXT_FOOTER = 2
+export const BORDER_NORMAL = 8
+export const BORDER_EMPHASIS = 12
+// Keep custom UI marks to glyphs listed in Even's G2 design guidelines.
+const G2_UI_GLYPHS = new Set('▲△▶▷▼▽◀◁●○■□★☆━─█▇▆▅▄▃▂▁')
+
+const G2_MARK = {
+  urgent: '!',
+  sensitive: '☆',
+  review: '○',
+  selected: '▶',
+  back: '◀',
+  offline: '○',
+  pending: '○',
+  accepted: '●',
+  customer: '●',
+  assistant: '★',
+  owner: '○',
+  micOn: '●',
+  micOff: '○',
+  stop: '■',
+  warning: '▲',
+} as const
+
+/**
+ * Quick single-tap sending is intentionally disabled. Every reply still goes
+ * through exact-text review and the separate final confirmation state.
+ */
+export const QUICK_TAP_ENABLED = false
 
 export const G2_MENU = {
   inboxOpen: 1,
+  scheduleToday: 2,
+  schedulePrevious: 3,
+  scheduleNext: 4,
+  scheduleInbox: 5,
   aiDraft: 10,
   voiceReply: 11,
   replyStatus: 12,
   resolve: 13,
   inbox: 14,
+  caseRefresh: 15,
   draftReview: 20,
   draftVoice: 21,
   draftCase: 22,
@@ -76,20 +124,34 @@ export const G2_MENU = {
   resolveCancel: 66,
 } as const
 
-function firmwareText(value: string): string {
+function normalizedFirmwareText(value: string): string {
   return value.normalize('NFKD')
     .replace(/\p{M}/gu, '')
     .replace(/[\u2018\u2019]/g, "'")
     .replace(/[\u201c\u201d]/g, '"')
     .replace(/[\u2012-\u2015]/g, '-')
     .replace(/\u2026/g, '...')
-    .replace(/[\u2022\u25cf]/g, '*')
+    .replace(/\u2022/g, '*')
+}
+
+function firmwareText(value: string): string {
+  return [...normalizedFirmwareText(value)].map((character) => {
+    const code = character.codePointAt(0) ?? 0
+    return character === '\n' || (code >= 0x20 && code <= 0x7e) || G2_UI_GLYPHS.has(character)
+      ? character
+      : '?'
+  }).join('')
+}
+
+function asciiFirmwareText(value: string): string {
+  return normalizedFirmwareText(value)
+    .replace(/\u25cf/g, '*')
     .replace(/[^\x20-\x7e\n]/g, '?')
 }
 
-/** Returns the exact ASCII string the native G2 display can show without glyph substitution. */
+/** Returns the ASCII display copy used to check exact customer text for safe review. */
 export function glassesReviewCopy(value: string): string {
-  return firmwareText(value)
+  return asciiFirmwareText(value)
 }
 
 export function needsGlassesReviewCopy(value: string): boolean {
@@ -105,8 +167,8 @@ export function hasUncertainApproval(state: Pick<GlassesState, 'errorCode' | 'bu
   return !state.busy && ['network_error', 'request_timeout', 'request_in_progress'].includes(state.errorCode ?? '')
 }
 
-export function wrapGlassesPreview(value: string, maxLines = 3, lineChars = LINE_CHARS): string {
-  const normalized = firmwareText(value).replace(/\s+/g, ' ').trim()
+export function wrapGlassesPreview(value: string, maxLines = 3, lineChars = CHARS_PER_LINE): string {
+  const normalized = asciiFirmwareText(value).replace(/\s+/g, ' ').trim()
   if (!normalized) return ''
   const width = Math.max(4, lineChars)
   const lines: string[] = []
@@ -130,7 +192,7 @@ export function wrapGlassesPreview(value: string, maxLines = 3, lineChars = LINE
 }
 
 /** Wraps every character in order; the returned pages are the text shown for exact review. */
-export function paginateGlassesText(value: string, lineChars = LINE_CHARS, linesPerPage = REVIEW_LINES): string[] {
+export function paginateGlassesText(value: string, lineChars = CHARS_PER_LINE, linesPerPage = REVIEW_LINES): string[] {
   const source = value.replace(/\r\n?/g, '\n')
   const lines: string[] = []
   for (const paragraph of source.split('\n')) {
@@ -151,27 +213,30 @@ export function paginateGlassesText(value: string, lineChars = LINE_CHARS, lines
   return pages.length ? pages : ['']
 }
 
-/** Keep approval content to three wrapped lines so labels and progress fit the native canvas. */
+/** Exact reply text gets the full body; page labels and progress stay in the footer. */
 export function paginateGlassesApprovalText(value: string): string[] {
-  return paginateGlassesText(value, LINE_CHARS, APPROVAL_LINES_PER_PAGE)
+  return paginateGlassesText(value, CHARS_PER_LINE, APPROVAL_LINES_PER_PAGE)
 }
 
-function compactLine(value: string, limit = 64): string {
-  const text = firmwareText(value).replace(/\s+/g, ' ').trim()
+export function paginateGlassesDisplayText(value: string, linesPerPage = REVIEW_LINES): string[] {
+  return paginateGlassesText(asciiFirmwareText(value), CHARS_PER_LINE, linesPerPage)
+}
+
+export function fitDisplay(value: string, limit = CHARS_PER_LINE): string {
+  const chars = [...firmwareText(value).replace(/\s+/g, ' ').trim()]
+  return chars.length <= limit ? chars.join('') : `${chars.slice(0, Math.max(0, limit - 3)).join('').trimEnd()}...`
+}
+
+export function actionFooter(index: number, total: number, label: string, hint = ''): string {
+  const base = fitDisplay(`Action ${index + 1}/${total} > ${label}`)
+  if (!hint) return base
+  const withHint = `${base}  |  ${hint}`
+  return [...firmwareText(withHint)].length <= CHARS_PER_LINE ? withHint : base
+}
+
+function compactLine(value: string, limit = CHARS_PER_LINE): string {
+  const text = asciiFirmwareText(value).replace(/\s+/g, ' ').trim()
   return text.length <= limit ? text : `${text.slice(0, Math.max(0, limit - 3)).trimEnd()}...`
-}
-
-function finalWordSuffix(value: string, limit: number): string {
-  const words = value.replace(/\n/g, ' ').trim().split(/\s+/).filter(Boolean)
-  const suffix: string[] = []
-  let length = 0
-  for (let index = words.length - 1; index >= 0; index -= 1) {
-    const nextLength = length + words[index].length + (suffix.length ? 1 : 0)
-    if (nextLength > limit) break
-    suffix.unshift(words[index])
-    length = nextLength
-  }
-  return `${suffix.length < words.length ? '... ' : ''}${suffix.join(' ')}`
 }
 
 type MenuEntry = readonly [number, string]
@@ -189,12 +254,15 @@ function textContainer(
   y: number,
   height: number,
   content: string,
-  options: { capture?: boolean; textColor?: number; borderWidth?: number; borderColor?: number; paddingLength?: number } = {},
+  options: {
+    capture?: boolean; textColor?: number; borderWidth?: number; borderColor?: number
+    paddingLength?: number; x?: number; width?: number
+  } = {},
 ): TextContainerProperty {
   return new TextContainerProperty({
-    xPosition: SAFE_X,
+    xPosition: options.x ?? SAFE_X,
     yPosition: y,
-    width: SAFE_WIDTH,
+    width: options.width ?? SAFE_WIDTH,
     height,
     containerID: id,
     containerName: name,
@@ -207,44 +275,83 @@ function textContainer(
   })
 }
 
-function pageWithText(
+function headerContainer(header: string): TextContainerProperty {
+  return textContainer(1, 'g2-head', 12, 34, fitDisplay(header, HEADER_CHARS), { textColor: TEXT_HEADER })
+}
+
+function footerContainers(left: string, right: string, firstId = 3): TextContainerProperty[] {
+  return [
+    textContainer(firstId, 'g2-foot', 244, 32, fitDisplay(left, FOOT_LEFT_CHARS), {
+      x: FOOT_LEFT_X, width: FOOT_LEFT_WIDTH, textColor: TEXT_FOOTER,
+    }),
+    textContainer(firstId + 1, 'g2-hint', 244, 32, fitDisplay(right, FOOT_RIGHT_CHARS), {
+      x: FOOT_RIGHT_X, width: FOOT_RIGHT_WIDTH, textColor: TEXT_FOOTER,
+    }),
+  ]
+}
+
+/** Header + one body box + separately aligned status and gesture hint. */
+function pageWithZones(
   screen: GlassesScreenId,
   header: string,
   body: string,
-  footer: string,
-  options: { recording?: boolean; menu?: readonly MenuEntry[]; key?: string } = {},
+  footLeft: string,
+  footRight: string,
+  options: { recording?: boolean; emphasis?: boolean; menu?: readonly MenuEntry[]; key?: string } = {},
 ): GlassesPage {
   const textObject = [
-    textContainer(1, 'g2-head', 12, 34, header, { textColor: 3 }),
+    headerContainer(header),
     textContainer(2, 'g2-main', 54, 174, body, {
       capture: true,
-      textColor: 4,
-      borderWidth: options.recording ? 2 : 1,
-      borderColor: options.recording ? 12 : 8,
+      textColor: TEXT_BODY,
+      borderWidth: options.recording || options.emphasis ? 2 : 1,
+      borderColor: options.recording || options.emphasis ? BORDER_EMPHASIS : BORDER_NORMAL,
       paddingLength: 10,
     }),
-    textContainer(3, 'g2-foot', 244, 32, footer, { textColor: 2 }),
+    ...footerContainers(footLeft, footRight),
   ]
   const menu = menuObject(options.menu ?? [])
   return {
     screen,
-    layoutKey: `text${options.recording ? '-recording' : ''}${options.key ? `-${options.key}` : ''}`,
+    layoutKey: `text${options.recording ? '-recording' : ''}${options.emphasis ? '-emphasis' : ''}${options.key ? `-${options.key}` : ''}`,
     containerTotalNum: textObject.length,
     textObject,
     ...(menu ? { menuObject: menu } : {}),
   }
 }
 
-function pageWithList(header: string, items: string[], summary: string, menu: readonly MenuEntry[]): GlassesPage {
+/** Compatibility helper for screens that still have a single footer label. */
+function pageWithText(
+  screen: GlassesScreenId,
+  header: string,
+  body: string,
+  footer: string,
+  options: { recording?: boolean; emphasis?: boolean; menu?: readonly MenuEntry[]; key?: string } = {},
+): GlassesPage {
+  return pageWithZones(screen, header, body, footer, '', options)
+}
+
+function pageWithList(
+  screen: GlassesScreenId,
+  header: string,
+  items: string[],
+  detail: string,
+  footer: string,
+  hint: string,
+  menu: readonly MenuEntry[],
+): GlassesPage {
   const textObject = [
-    textContainer(1, 'g2-head', 12, 34, header, { textColor: 3 }),
-    textContainer(3, 'g2-foot', 218, 58, summary, { textColor: 4, borderWidth: 1, borderColor: 8, paddingLength: 7 }),
+    headerContainer(header),
+    textContainer(3, 'g2-detail', 180, 60, detail, {
+      textColor: TEXT_BODY, borderWidth: 1, borderColor: BORDER_NORMAL, paddingLength: 5,
+    }),
+    ...footerContainers(footer, hint, 4),
   ]
   const list = new ListContainerProperty({
     xPosition: SAFE_X,
     yPosition: 52,
     width: SAFE_WIDTH,
-    height: 158,
+    height: 126,
     containerID: 2,
     containerName: 'g2-list',
     isEventCapture: 1,
@@ -256,8 +363,8 @@ function pageWithList(header: string, items: string[], summary: string, menu: re
     }),
   })
   return {
-    screen: 'inbox',
-    layoutKey: 'list',
+    screen,
+    layoutKey: screen === 'schedule' ? 'schedule-list' : 'inbox-list-detail',
     containerTotalNum: textObject.length + 1,
     textObject,
     listObject: [list],
@@ -265,17 +372,76 @@ function pageWithList(header: string, items: string[], summary: string, menu: re
   }
 }
 
-function ageLabel(iso: string): string {
-  const minutes = Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 60_000))
-  if (!Number.isFinite(minutes) || minutes < 1) return 'NOW'
-  if (minutes < 60) return `${minutes}M`
-  if (minutes < 1_440) return `${Math.floor(minutes / 60)}H`
-  return `${Math.floor(minutes / 1_440)}D`
+function pageWithChoices(
+  screen: GlassesScreenId,
+  header: string,
+  items: string[],
+  footLeft: string,
+  footRight: string,
+  menu: readonly MenuEntry[],
+  key: string,
+  detail = '',
+): GlassesPage {
+  const textObject = [
+    headerContainer(header),
+    ...(detail ? [textContainer(5, 'g2-detail', 54, 44, detail, {
+      textColor: TEXT_BODY, borderWidth: 1, borderColor: BORDER_NORMAL, paddingLength: 5,
+    })] : []),
+    ...footerContainers(footLeft, footRight),
+  ]
+  const builtMenu = menuObject(menu)
+  const listTop = detail ? 104 : 54
+  const listHeight = detail ? 124 : 174
+  const list = new ListContainerProperty({
+    xPosition: SAFE_X,
+    yPosition: listTop,
+    width: SAFE_WIDTH,
+    height: listHeight,
+    containerID: 2,
+    containerName: 'g2-list',
+    isEventCapture: 1,
+    itemContainer: new ListItemContainerProperty({
+      itemCount: items.length,
+      itemWidth: SAFE_WIDTH - 12,
+      isItemSelectBorderEn: 1,
+      itemName: items,
+    }),
+  })
+  return {
+    screen,
+    layoutKey: `choices-${key}`,
+    containerTotalNum: textObject.length + 1,
+    textObject,
+    listObject: [list],
+    ...(builtMenu ? { menuObject: builtMenu } : {}),
+  }
 }
 
-function appHeader(state: GlassesState, label: string): string {
-  const attention = state.error ? '  |  ACTION NEEDED' : state.connection === 'offline' ? '  |  OFFLINE' : ''
-  return `${state.fixtureMode ? 'GLANCE DEMO' : 'REMBOAI / GLANCE'}  |  ${label}${attention}`
+function ageLabel(iso: string): string {
+  const minutes = Math.max(0, Math.floor((Date.now() - Date.parse(iso)) / 60_000))
+  if (!Number.isFinite(minutes) || minutes < 1) return 'now'
+  if (minutes < 60) return `${minutes} min`
+  if (minutes < 1_440) return `${Math.floor(minutes / 60)} hr`
+  return `${Math.floor(minutes / 1_440)} d`
+}
+
+function inboxAgeLabel(iso: string): string {
+  return ageLabel(iso).replace(' min', 'm').replace(' hr', 'h').replace(' d', 'd')
+}
+
+function appHeader(state: GlassesState, label: string, screenAlert = ''): string {
+  const alert = screenAlert || (state.error ? 'Action needed' : state.connection === 'offline' ? 'Offline' : '')
+  const mark = screenAlert || state.error ? G2_MARK.warning : state.connection === 'offline' ? G2_MARK.offline : ''
+  const prefix = alert ? `${mark} ${alert} | ` : ''
+  return fitDisplay(`${prefix}${label}`, HEADER_CHARS)
+}
+
+function attentionMark(category: string): string {
+  switch (caseAttentionTier(category)) {
+    case 'urgent': return G2_MARK.urgent
+    case 'sensitive': return G2_MARK.sensitive
+    default: return G2_MARK.review
+  }
 }
 
 function inboxPage(state: GlassesState): GlassesPage {
@@ -283,99 +449,171 @@ function inboxPage(state: GlassesState): GlassesPage {
   const selectedIndex = items.length ? Math.min(Math.max(0, state.selectedIndex), items.length - 1) : 0
   const selected = items[selectedIndex]
   const count = state.inbox?.open_count ?? 0
-  const stateLabel = state.inboxStale ? 'STALE' : state.connection === 'offline' ? 'OFFLINE' :
-    state.connection === 'loading' ? 'SYNC' : state.newCaseAvailable ? 'NEW CASE' : 'OPEN'
-  const header = appHeader(state, `${count} ${stateLabel}`)
+  const stateLabel = state.inboxStale ? 'Stale' : state.connection === 'offline' ? 'Offline' :
+    state.connection === 'loading' ? 'Syncing' : state.newCaseAvailable ? 'New case' : 'Open'
+  const urgentCount = items.filter((item) => caseAttentionTier(item.category) === 'urgent').length
+  const sensitiveCount = items.filter((item) => caseAttentionTier(item.category) === 'sensitive').length
+  const visibleSuffix = state.inbox?.has_more ? ' shown' : ''
+  const priority = urgentCount ? `${G2_MARK.urgent} ${urgentCount} urgent${visibleSuffix}` :
+    sensitiveCount ? `${G2_MARK.sensitive} ${sensitiveCount} sensitive${visibleSuffix}` : ''
+  const brand = state.fixtureMode ? 'Glance demo' : 'RemboAI Glance'
+  const header = appHeader(state, `${brand} | ${count} ${stateLabel}${priority ? ` | ${priority}` : ''}`)
   if (items.length) {
-    const rows = items.map((item) => compactLine(
-      `${item.customer_label}  |  ${item.channel.toUpperCase()}  |  ${categoryLabel(item.category).toUpperCase()}  |  ${ageLabel(item.created_at)}`,
-      64,
-    ))
-    const summary = selected
-      ? `${compactLine(`${selected.customer_label.toUpperCase()}  ${selectedIndex + 1}/${items.length}  TAP TO OPEN${state.inbox?.has_more ? '  |  MORE CASES' : ''}`, 64)}\n${compactLine(selected.preview, 64)}`
-      : 'NO CASE SELECTED'
-    return pageWithList(header, rows, summary, [[G2_MENU.inboxOpen, 'Open selected case']])
+    const rows = items.map((item) =>
+      fitDisplay(`${attentionMark(item.category)} ${compactLine(
+        `${item.customer_label} | ${categoryLabel(item.category)} | ${inboxAgeLabel(item.created_at)}`,
+        LIST_ROW_CHARS - 2,
+      )}`, LIST_ROW_CHARS),
+    )
+    const detail = selected
+      ? `${fitDisplay(`${G2_MARK.selected} ${selectedIndex + 1}/${items.length} | ${caseAttentionLabel(selected.category)} | ${channelLabel(selected.channel)} | ${inboxAgeLabel(selected.created_at)}`, CHARS_PER_LINE)}\n${wrapGlassesPreview(selected.preview, 2, CHARS_PER_LINE)}`
+      : 'No case selected'
+    const footer = state.inboxStale ? 'Cached inbox' : `${count} open${state.inbox?.has_more ? ' | More' : ''}`
+    return pageWithList('inbox', header, rows, detail, footer, 'Click to open', [
+      [G2_MENU.inboxOpen, 'Open selected case'],
+      [G2_MENU.scheduleToday, 'Show today schedule'],
+    ])
   }
   const body = state.connection === 'loading'
-    ? 'CHECKING OPEN ESCALATIONS\nYOUR INBOX WILL UPDATE WHEN READY'
+    ? 'Checking open cases\nYour inbox will update when ready'
     : state.connection === 'offline'
-      ? 'GLANCE IS ACTIVE\nINBOX CONNECTION UNAVAILABLE\nSHOWING NO NEW DATA'
-      : 'GLANCE IS ACTIVE\nNO OPEN ESCALATIONS\nYOU ARE ALL CAUGHT UP'
-  return pageWithText('inbox', header, body, state.inboxStale ? 'CACHED VIEW  |  SWIPE TO RETRY' : 'DOUBLE TAP TO EXIT', {
-    menu: [[G2_MENU.inboxOpen, 'Refresh inbox']], key: 'home',
+      ? `${G2_MARK.offline} Inbox unavailable\nShowing no new data.`
+      : `${G2_MARK.accepted} All caught up\nNo open escalations.`
+  return pageWithZones('inbox', header, body, state.inboxStale ? 'Cached view' : '', 'Double tap to exit', {
+    menu: [[G2_MENU.inboxOpen, 'Refresh inbox'], [G2_MENU.scheduleToday, 'Show today schedule']], key: 'home',
   })
 }
 
-const CASE_ACTIONS = ['AI SUGGESTION', 'VOICE REPLY', 'REPLY STATUS', 'RESOLVE', 'INBOX']
+function scheduleTime(iso: string, timezone: string): string {
+  const value = new Date(iso)
+  if (!Number.isFinite(value.getTime())) return '--:--'
+  try {
+    return new Intl.DateTimeFormat('en', {
+      hour: '2-digit', minute: '2-digit', hour12: false, timeZone: timezone,
+    }).format(value)
+  } catch {
+    return new Intl.DateTimeFormat('en', { hour: '2-digit', minute: '2-digit', hour12: false }).format(value)
+  }
+}
+
+function schedulePage(state: GlassesState): GlassesPage {
+  const schedule = state.schedule
+  const header = appHeader(state, schedule ? `Schedule | ${schedule.date}` : 'Schedule')
+  const actions: Array<[number, string]> = []
+  const labels: string[] = []
+  if (schedule && state.scheduleOffset > 0) {
+    actions.push([G2_MENU.schedulePrevious, 'Previous schedule page'])
+    labels.push('Previous page')
+  }
+  if (schedule?.has_more) {
+    actions.push([G2_MENU.scheduleNext, 'Next schedule page'])
+    labels.push('Next page')
+  }
+  actions.push([G2_MENU.scheduleInbox, 'Back to inbox'])
+  labels.push('Back to inbox')
+  const selected = Math.min(Math.max(0, state.focusedAction), labels.length - 1)
+  if (!schedule) return pageWithZones('schedule', header, 'Loading today\'s program', 'Please wait', '')
+  if (!schedule.items.length) return pageWithZones(
+    'schedule', header, 'No active bookings.\nYour program is clear.',
+    actionFooter(selected, labels.length, labels[selected]), 'Hold for actions', { menu: actions, key: 'empty' },
+  )
+  const rows = schedule.items.map((item) => compactLine(
+    `${scheduleTime(item.starts_at, schedule.timezone)}  ${item.customer_label}  |  ${item.service} - ${item.staff}`,
+    CHARS_PER_LINE,
+  ))
+  const first = schedule.items[0]
+  const last = schedule.items.at(-1)
+  const summary = compactLine(
+    `${schedule.count} shown${schedule.has_more ? '  |  More' : ''}  ${scheduleTime(first.starts_at, schedule.timezone)}-${scheduleTime(last?.ends_at ?? last?.starts_at ?? first.ends_at, schedule.timezone)}`,
+    CHARS_PER_LINE,
+  )
+  return pageWithChoices('schedule', header, rows, summary, 'Hold for actions', actions, 'schedule')
+}
+
+function caseMenu(): MenuEntry[] {
+  return [
+    [G2_MENU.aiDraft, 'AI suggestion'],
+    [G2_MENU.voiceReply, 'Dictate reply'],
+    [G2_MENU.replyStatus, 'Reply status'],
+    [G2_MENU.resolve, 'Resolve case'],
+    [G2_MENU.inbox, 'Back to inbox'],
+  ]
+}
 
 function casePage(state: GlassesState): GlassesPage {
   const item = state.caseData
-  if (!item) return pageWithText('loading', appHeader(state, 'CASE'), 'LOADING CASE DETAILS', 'PLEASE WAIT')
+  if (!item) return pageWithZones('loading', appHeader(state, 'Case'), 'Loading case details', 'Please wait', '')
   if (item.status === 'resolved') {
-    const actions = item.latest_reply ? ['CHECK REPLY STATUS', 'BACK TO INBOX'] : ['BACK TO INBOX']
-    const selected = Math.min(state.focusedAction, actions.length - 1)
-    const action = actions[selected]
-    return pageWithText(
-      'case-resolved', appHeader(state, 'RESOLVED'),
-      `${compactLine(item.customer_label.toUpperCase(), 42)}\nOWNER CONFIRMED\nHANDLING COMPLETE\n${item.latest_reply ? `REPLY  ${presentReplyState(item.latest_reply.state, item.channel).label.toUpperCase()}` : 'NO OUTBOUND REPLY'}`,
-      `ACTION  ${selected + 1}/${actions.length}  > ${action}  |  DOUBLE SELECT`,
-      { menu: item.latest_reply ? [[G2_MENU.replyStatus, 'Check reply status'], [G2_MENU.inbox, 'Back to inbox']] : [[G2_MENU.inbox, 'Back to inbox']] },
-    )
+    const reply = item.latest_reply
+      ? `Reply: ${presentReplyState(item.latest_reply.state, item.channel).label}`
+      : 'No outbound reply.'
+    return pageWithZones('case-resolved', appHeader(state, `${G2_MARK.accepted} Resolved | ${compactLine(item.customer_label, 18)}`),
+      `Owner confirmed\nHandling complete.\n${reply}`, `Case v${item.version}`, 'Hold for actions', {
+        menu: item.latest_reply
+          ? [[G2_MENU.replyStatus, 'Reply status'], [G2_MENU.inbox, 'Back to inbox']]
+          : [[G2_MENU.inbox, 'Back to inbox']],
+        key: 'resolved',
+      })
+  }
+
+  const name = compactLine(item.customer_label, 18)
+  if (state.stale) {
+    return pageWithZones('case', appHeader(state, `${G2_MARK.warning} Case updated | ${name}`),
+      'Case changed on another device.\nRefresh before acting.', state.draft ? 'Draft not sent' : '', 'Hold for actions', {
+        emphasis: true,
+        menu: [[G2_MENU.caseRefresh, 'Refresh case'], [G2_MENU.inbox, 'Back to inbox']],
+        key: 'stale',
+      })
   }
 
   const pageCount = Math.ceil(item.context.length / CONTEXT_PAGE_SIZE)
   const pageIndex = pageCount > 0 ? Math.min(Math.max(0, Math.floor(state.messagePage) || 0), pageCount - 1) : 0
   const chronologicalPage = pageCount > 0 ? pageCount - 1 - pageIndex : 0
   const visible = messagePage(item.context, chronologicalPage, CONTEXT_PAGE_SIZE)
-  const context = visible.map((message) => {
-    const actor = message.actor === 'customer' ? 'CUSTOMER' : message.actor === 'assistant' ? 'REMBOAI' : 'OWNER'
-    return `${actor}: ${wrapGlassesPreview(message.text, 2, 43)}`
-  }).join('\n')
-  const history = pageIndex === pageCount - 1 && item.has_earlier ? 'EARLIER HISTORY OMITTED' : ''
-  const action = CASE_ACTIONS[Math.min(state.focusedAction, CASE_ACTIONS.length - 1)]
-  const body = [
-    `${compactLine(item.customer_label.toUpperCase(), 34)}  |  OPEN  |  V${item.version}`,
-    `${categoryLabel(item.category).toUpperCase()}  |  ${item.channel.toUpperCase()}`,
-    pageCount ? `MSG ${pageIndex + 1}/${pageCount}  |  ${item.context.length} VISIBLE` : 'MSG 0/0',
-    context || 'NO CUSTOMER-VISIBLE MESSAGES',
-    history,
-    state.stale ? 'CASE UPDATED  |  REFRESH BEFORE ACTING' : '',
-  ].filter(Boolean).join('\n')
-  const menu: MenuEntry[] = [
-    [G2_MENU.aiDraft, 'Generate AI suggestion'],
-    [G2_MENU.voiceReply, 'Dictate a reply'],
-    [G2_MENU.replyStatus, 'Check reply status'],
-    [G2_MENU.resolve, 'Resolve case'],
-    [G2_MENU.inbox, 'Back to inbox'],
-  ]
-  const footer = state.busy
-    ? `WORKING  |  ${state.busyAction.replaceAll('-', ' ').toUpperCase()}`
-    : `ACTION  ${Math.min(state.focusedAction, CASE_ACTIONS.length - 1) + 1}/${CASE_ACTIONS.length}  > ${action}  |  SWIPE MSG`
-  return pageWithText('case', appHeader(state, 'CASE'), body, footer, { menu })
+  const message = visible[0]
+  const text = message
+    ? message.actor === 'customer'
+      ? message.text
+      : `(${message.actor === 'assistant' ? 'RemboAI' : 'Owner'}) ${message.text}`
+    : ''
+  const pages = paginateGlassesText(asciiFirmwareText(text), CHARS_PER_LINE, REVIEW_LINES)
+  const textPage = Math.min(Math.max(0, Math.floor(state.messageTextPage ?? 0), 0), pages.length - 1)
+  const atOldest = pageCount > 0 && pageIndex === pageCount - 1
+  const position = pageCount ? `Message ${pageIndex * CONTEXT_PAGE_SIZE + 1}/${item.context.length}` : 'No messages'
+  const footLeft = state.busy
+    ? `Working: ${state.busyAction.replaceAll('-', ' ')}`
+    : `${position}${pages.length > 1 ? ` | Page ${textPage + 1}/${pages.length}` : atOldest && item.has_earlier ? ' | Earlier hidden' : ''}`
+  const footRight = state.busy ? '' : pages.length > 1 && textPage < pages.length - 1 ? 'Swipe for more' : 'Hold for actions'
+  const header = `${attentionMark(item.category)} ${caseAttentionLabel(item.category)} | ${name} | ${categoryLabel(item.category)} | ${channelLabel(item.channel)}`
+  return pageWithZones('case', appHeader(state, header), pages[textPage] || 'No customer-visible messages.',
+    footLeft, footRight, { emphasis: caseAttentionTier(item.category) === 'urgent', menu: caseMenu(), key: `open-${caseAttentionTier(item.category)}` })
 }
 
-const DRAFT_ACTIONS = ['REVIEW EXACT REPLY', 'DICTATE REVISION', 'BACK TO CASE']
-
 function draftPage(state: GlassesState): GlassesPage {
-  const text = state.editorText || state.draft?.text || ''
-  const canCreateSafeCopy = Boolean(text && canCreateDisplaySafeCopy(text))
-  const actions = canCreateSafeCopy ? [...DRAFT_ACTIONS, 'CREATE ASCII COPY'] : DRAFT_ACTIONS
-  const pages = paginateGlassesText(text)
+  const sourceText = state.editorText || state.draft?.text || ''
+  const text = asciiFirmwareText(sourceText)
+  const canCreateSafeCopy = Boolean(sourceText && canCreateDisplaySafeCopy(sourceText))
+  const pages = paginateGlassesText(text, CHARS_PER_LINE, REVIEW_LINES)
   const pageIndex = Math.min(Math.max(0, Math.floor(state.draftPage) || 0), pages.length - 1)
   const expired = Boolean(state.draft && Date.parse(state.draft.expires_at) <= Date.now())
-  const source = state.draft?.source === 'owner' || state.manualMode ? 'OWNER DRAFT' : 'AI SUGGESTION'
-  const safeCopyTooLong = Boolean(text && needsGlassesReviewCopy(text) && !canCreateSafeCopy)
-  const selected = actions[Math.min(state.focusedAction, actions.length - 1)]
-  const body = text
-    ? `${state.stale ? 'CASE CHANGED  |  DRAFT STALE\n' : ''}${expired ? 'DRAFT EXPIRED\n' : ''}${pages[pageIndex]}\n\n${pageIndex + 1}/${pages.length}  |  ${source}  |  NOT SENT${safeCopyTooLong ? '\nDISPLAY COPY EXCEEDS 700 CHARS' : ''}`
-    : `${source}\nNO TEXT SAVED\nUSE VOICE INPUT TO DICTATE A CUSTOMER REPLY`
-  return pageWithText('draft', appHeader(state, `${source} · ${pageIndex + 1}/${pages.length}`), body,
-    `ACTION  ${Math.min(state.focusedAction, actions.length - 1) + 1}/${actions.length}  > ${selected}  |  SWIPE TEXT`, {
+  const owner = state.draft?.source === 'owner' || state.manualMode
+  const source = owner ? `${G2_MARK.owner} Owner draft` : `${G2_MARK.assistant} AI draft`
+  const safeCopyTooLong = Boolean(sourceText && needsGlassesReviewCopy(sourceText) && !canCreateSafeCopy)
+  const warning = state.stale ? 'Case changed' : expired ? 'Draft expired' : safeCopyTooLong ? 'Display copy too long' : ''
+  const header = state.stale ? 'Draft stale'
+    : expired ? 'Not sent'
+      : `${source}${pages.length > 1 ? ` ${pageIndex + 1}/${pages.length}` : ''} | Not sent`
+  const footLeft = state.stale || expired ? 'Do not send'
+    : safeCopyTooLong ? 'Display copy too long'
+      : pages.length > 1 ? `Page ${pageIndex + 1}/${pages.length}` : 'Not sent'
+  const footRight = pages.length > 1 && pageIndex < pages.length - 1 ? 'Swipe for more' : 'Hold for actions'
+  return pageWithZones('draft', appHeader(state, header, warning),
+    text ? pages[pageIndex] : 'No text saved.\nUse voice to dictate a reply.', footLeft, footRight, {
       menu: [
-        [G2_MENU.draftReview, 'Review exact reply'],
+        [G2_MENU.draftReview, 'Review reply'],
         [G2_MENU.draftVoice, 'Dictate revision'],
         [G2_MENU.draftCase, 'Back to case'],
-        ...(canCreateSafeCopy ? [[G2_MENU.draftSafeCopy, 'Create display-safe copy'] as const] : []),
+        ...(canCreateSafeCopy ? [[G2_MENU.draftSafeCopy, 'ASCII copy'] as const] : []),
       ], key: `draft-${Boolean(state.stale)}-${expired}`,
     })
 }
@@ -385,178 +623,212 @@ function formatDuration(milliseconds: number): string {
   return `00:${String(seconds).padStart(2, '0')}`
 }
 
+const METER_LEVELS = '▁▂▃▄▅▆▇█'
+
+function levelMeter(milliseconds: number, width = 24): string {
+  const t = milliseconds / 140
+  return Array.from({ length: width }, (_, index) => {
+    const level = Math.abs(Math.sin(t + index * 0.55) * Math.cos(t * 0.37 + index * 0.21))
+    return METER_LEVELS[Math.min(7, Math.floor(level * 8))]
+  }).join('')
+}
+
+function progressBar(ratio: number, width = 26): string {
+  const filled = Math.round(Math.min(1, Math.max(0, ratio)) * width)
+  return `${'━'.repeat(filled)}${'─'.repeat(width - filled)}`
+}
+
 function voicePage(state: GlassesState): GlassesPage {
   const phase = state.voicePhase
   if (phase === 'transcript_ready') {
-    const pages = paginateGlassesText(state.voiceTranscript, 46, 3)
+    const pages = paginateGlassesText(asciiFirmwareText(state.voiceTranscript), CHARS_PER_LINE, REVIEW_LINES)
     const page = Math.min(Math.max(0, Math.floor(state.transcriptPage) || 0), pages.length - 1)
     const canRevise = Boolean(state.caseData && state.draft && canUseTranscriptAsInstruction(
       state.caseData, state.draft, state.stale, state.editorText, state.voiceTranscript,
     ))
-    const actions = ['USE AS REPLY', canRevise ? 'USE AS INSTRUCTION' : 'AI DRAFT NEEDED', 'CANCEL']
-    const selected = Math.min(state.focusedAction, actions.length - 1)
-    const body = `${state.voiceSimulation ? 'SIMULATED TRANSCRIPT\n' : ''}NOT SENT  |  ${page + 1}/${pages.length}\n${pages[page]}\n\nCAPTURE ${formatDuration(state.voiceDurationMs)}  |  TRANSCRIBED`
-    const intentBody = canRevise ? body : `${body}\nAI DRAFT NEEDED BEFORE REVISION`
     const menu: MenuEntry[] = [
       [G2_MENU.transcriptReply, 'Use as reply'],
-      [G2_MENU.transcriptInstruction, canRevise ? 'Use as instruction' : 'AI draft required'],
-      [G2_MENU.voiceCancel, 'Cancel transcript'],
+      [G2_MENU.transcriptInstruction, canRevise ? 'Use as instruction' : 'Draft needed'],
+      [G2_MENU.voiceCancel, 'Cancel'],
     ]
-    return pageWithText('transcript-preview', appHeader(state, 'TRANSCRIPT'), intentBody,
-      `ACTION  ${selected + 1}/3  > ${actions[selected]}  |  DOUBLE SELECT`, { menu, key: canRevise ? 'transcript-ai' : 'transcript-manual' })
+    return pageWithZones('transcript-preview', appHeader(state, `Transcript | ${state.voiceSimulation ? 'Simulated' : 'Not sent'}`),
+      pages[page], pages.length > 1 ? `Page ${page + 1}/${pages.length}` : 'Not sent', 'Use menu to choose', {
+        menu, key: canRevise ? 'transcript-ai' : 'transcript-manual',
+      })
   }
   if (phase === 'recording') {
-    const selected = Math.min(state.focusedAction, 1)
-    const action = selected === 0 ? 'STOP AND REVIEW' : 'CANCEL'
-    return pageWithText('voice-recording', appHeader(state, 'VOICE INPUT'),
-      `${state.voiceSimulation ? 'SIMULATION  |  MIC OFF' : 'RECORDING  |  G2 MIC ACTIVE'}\nELAPSED  ${formatDuration(state.voiceDurationMs)} / 00:40\n${state.voiceSimulation ? 'NO AUDIO BUFFERED' : 'AUDIO IN MEMORY ONLY'}\n\n${action}`,
-      `ACTION  ${selected + 1}/2  > ${action}  |  ${selected === 0 ? 'CANCEL' : 'STOP'}`, {
+    const body = state.voiceSimulation
+      ? `${formatDuration(state.voiceDurationMs)} / 00:40\nSimulation only\n${progressBar(state.voiceDurationMs / 40_000)}`
+      : `${formatDuration(state.voiceDurationMs)} / 00:40\n${levelMeter(state.voiceDurationMs)}\n${progressBar(state.voiceDurationMs / 40_000)}`
+    return pageWithZones('voice-recording', appHeader(state, `Voice input | ${state.voiceSimulation ? `${G2_MARK.micOff} Simulation` : `${G2_MARK.micOn} Recording`}`),
+      body, state.voiceSimulation ? 'No audio buffered' : 'Audio stays in memory', 'Use menu to stop', {
         recording: true,
-        menu: [[G2_MENU.voiceStop, 'Stop and review'], [G2_MENU.voiceCancel, 'Cancel recording']],
+        menu: [[G2_MENU.voiceStop, 'Stop and review'], [G2_MENU.voiceCancel, 'Cancel recording']], key: 'recording',
       })
   }
   if (phase === 'starting' || phase === 'stopping' || phase === 'transcribing') {
-    const label = phase === 'starting' ? 'STARTING G2 MICROPHONE' : phase === 'stopping' ? 'STOPPING MICROPHONE' : 'TRANSCRIBING AUDIO'
-    return pageWithText('voice-ready', appHeader(state, 'VOICE INPUT'),
-      `${label}\n\nWAIT FOR CONFIRMATION\nAUDIO IS NOT SAVED`, 'NO ACTION UNTIL COMPLETE', { key: phase })
+    const label = phase === 'starting' ? 'Starting microphone' : phase === 'stopping' ? 'Stopping microphone' : 'Transcribing'
+    return pageWithZones('voice-ready', appHeader(state, `Voice input | ${label}`),
+      `${label}\n${'○ ● ○'}`, 'Audio is not saved', 'Please wait', { key: phase })
   }
   if (phase === 'error') {
-    const selected = Math.min(state.focusedAction, 1)
-    const action = selected === 0 ? 'RETRY' : 'BACK TO CASE'
-    return pageWithText('voice-ready', appHeader(state, 'VOICE STOPPED'),
-      `MICROPHONE OFF\n${wrapGlassesPreview(state.voiceError || 'VOICE INPUT STOPPED', 3, 44)}\n\n${action}`,
-      `ACTION  ${selected + 1}/2  |  DOUBLE SELECT`, {
-        menu: [[G2_MENU.voiceStart, 'Start again'], [G2_MENU.voiceCancel, 'Back to case']],
+    return pageWithZones('voice-ready', appHeader(state, `${G2_MARK.warning} Voice stopped | Mic off`),
+      wrapGlassesPreview(state.voiceError || 'Voice input stopped', REVIEW_LINES - 2), 'Mic off', 'Use menu to retry', {
+        menu: [[G2_MENU.voiceStart, 'Start again'], [G2_MENU.voiceCancel, 'Back to case']], key: 'error',
       })
   }
-  const selected = Math.min(state.focusedAction, 1)
-  return pageWithText('voice-ready', appHeader(state, 'VOICE INPUT'),
-    `${state.voiceSimulation ? 'SIMULATION ONLY\n' : ''}MICROPHONE OFF\nSTART WHEN READY\nMAXIMUM 40 SECONDS\n\n${selected === 0 ? '> START  |  BACK' : 'START  |  > BACK'}`,
-    'CLICK TO CHOOSE  |  DOUBLE SELECT', {
+  return pageWithZones('voice-ready', appHeader(state, `Voice input | ${G2_MARK.micOff} Mic off`),
+    `${state.voiceSimulation ? 'Simulation only\n' : ''}Ready to dictate.\nUp to 40 seconds.`, 'Audio stays in memory', 'Use menu to start', {
       menu: [[G2_MENU.voiceStart, 'Start recording'], [G2_MENU.voiceCancel, 'Back to case']],
+      key: 'ready',
     })
 }
 
-const APPROVAL_ACTIONS = ['APPROVE & QUEUE', 'CANCEL']
+const APPROVAL_ACTIONS = ['Approve & queue', 'Cancel']
 
 function approvalPage(state: GlassesState): GlassesPage {
+  const pages = paginateGlassesApprovalText(state.approvalText)
   if (state.approvalStage === 'confirm') {
-    const selected = Math.min(state.focusedAction, 1)
     const draft = state.draft
+    const item = state.caseData
+    const name = item ? compactLine(item.customer_label, 18) : 'customer'
     const waiting = state.busy && state.busyAction === 'approve'
     const uncertain = hasUncertainApproval(state)
     const asciiSafe = /^[\x20-\x7e\n]+$/.test(state.approvalText)
-    const canApprove = Boolean(draft && state.caseData?.status === 'open' && !state.stale && asciiSafe &&
-      Date.parse(draft.expires_at) > Date.now() && draft.based_on_version === state.caseData.version)
-    const options: MenuEntry[] = waiting ? [] : uncertain
-      ? [[G2_MENU.approvalStatus, 'Check reply status'], [G2_MENU.approvalRetry, 'Retry same approval key'], [G2_MENU.approvalCancel, 'Leave review']]
-      : canApprove
-      ? [[G2_MENU.approvalConfirm, 'Approve and queue'], [G2_MENU.approvalCancel, 'Cancel review']]
-      : [[G2_MENU.approvalCancel, 'Cancel review']]
-    const actions = waiting ? ['WAIT FOR RESULT'] : uncertain
-      ? ['CHECK STATUS', 'RETRY SAME KEY', 'LEAVE REVIEW']
-      : canApprove ? APPROVAL_ACTIONS : ['CANCEL']
-    const visibleSelected = Math.min(Math.max(0, selected), actions.length - 1)
-    const pages = paginateGlassesApprovalText(state.approvalText)
-    const tail = finalWordSuffix(pages.at(-1) ?? '', 58)
-    const warning = !asciiSafe ? 'UNSUPPORTED DISPLAY CHARACTERS\nREPHRASE BEFORE APPROVAL' :
-      state.stale || !draft || !state.caseData || draft.based_on_version !== state.caseData.version ? 'CASE OR DRAFT CHANGED\nREFRESH BEFORE APPROVAL' :
-        draft && Date.parse(draft.expires_at) <= Date.now() ? 'DRAFT EXPIRED\nCREATE A NEW DRAFT' : ''
-    const outcome = waiting ? 'APPROVAL REQUEST IN FLIGHT' : uncertain
-      ? state.errorCode === 'request_in_progress' ? 'REQUEST STILL PROCESSING' : 'OUTCOME UNCERTAIN | CHECK STATUS'
-      : 'NOT SENT'
-    const errorDetail = uncertain ? `\n${compactLine(state.error.toUpperCase(), 44)}` : ''
-    return pageWithText('draft', appHeader(state, 'FINAL CONFIRMATION'),
-      `${warning ? `${warning}\n` : ''}REVIEWED ${pages.length}/${pages.length} PAGES\nFINAL WORDS: ${wrapGlassesPreview(tail, 2, 46)}\n${outcome}${errorDetail}`,
-      waiting ? 'WAIT FOR BACKEND RESULT' : `ACTION  ${visibleSelected + 1}/${actions.length}  > ${actions[visibleSelected]}  |  DOUBLE SELECT`, {
-        menu: options, key: 'approval-confirm',
-      })
+    const expired = Boolean(draft && Date.parse(draft.expires_at) <= Date.now())
+    const current = Boolean(draft && item && item.status === 'open' && !state.stale && draft.based_on_version === item.version)
+
+    if (waiting) return pageWithZones('draft', appHeader(state, `Sending | ${name}`),
+      `Approval request in flight.\n${'○ ● ○'}`, 'Not sent yet', 'Wait for result', { key: 'approval-wait' })
+
+    if (uncertain) {
+      const labels = ['Check status', 'Retry same key', 'Leave review']
+      const menu: MenuEntry[] = [
+        [G2_MENU.approvalStatus, 'Check status'],
+        [G2_MENU.approvalRetry, 'Retry same key'],
+        [G2_MENU.approvalCancel, 'Leave review'],
+      ]
+      return pageWithChoices('draft', appHeader(state, `${G2_MARK.warning} Outcome uncertain | ${name}`), labels,
+        compactLine(state.error || 'Not confirmed', FOOT_LEFT_CHARS), 'Double press to choose', menu, 'approval-uncertain')
+    }
+
+    if (!current || !asciiSafe || expired) {
+      const reason = !asciiSafe ? 'Unsupported display characters.\nRephrase before approval.'
+        : expired ? 'Draft expired.\nCreate a new draft.'
+          : 'Case or draft changed.\nRefresh before approval.'
+      return pageWithZones('draft', appHeader(state, `${G2_MARK.warning} Cannot send | ${name}`),
+        reason, 'Not sent', 'Use menu to cancel', {
+          emphasis: true, menu: [[G2_MENU.approvalCancel, 'Cancel review']], key: 'approval-blocked',
+        })
+    }
+
+    return pageWithChoices('draft', appHeader(state, `Send to ${name}? | Not sent yet`),
+      [...APPROVAL_ACTIONS], 'Not sent', 'Double press to choose', [
+        [G2_MENU.approvalConfirm, 'Approve & queue'],
+        [G2_MENU.approvalCancel, 'Cancel'],
+      ], 'approval-confirm')
   }
 
-  const pages = paginateGlassesApprovalText(state.approvalText)
   const page = Math.min(Math.max(0, Math.floor(state.approvalPage) || 0), pages.length - 1)
   const reviewedPages = Math.min(pages.length, Math.max(0, Math.floor(state.approvalProgress) || 0))
-  const body = `${state.stale ? 'CASE CHANGED  |  STOP REVIEW\n' : ''}REPLY ${page + 1}/${pages.length}  |  EXACT FINAL TEXT\n${pages[page]}\n\nPROGRESS ${reviewedPages}/${pages.length} PAGES COMPLETE`
-  return pageWithText('draft', appHeader(state, `EXACT REPLY ${page + 1}/${pages.length}`), body,
-    page + 1 < pages.length ? 'SWIPE DOWN TO CONTINUE REVIEW' : 'SWIPE DOWN FOR FINAL CONFIRMATION', {
+  const stale = state.stale || !state.draft || !state.caseData || state.draft.based_on_version !== state.caseData.version
+  const supported = /^[\x20-\x7e\n]+$/.test(state.approvalText)
+  const alert = stale ? 'Stop review'
+    : !supported ? 'Review unavailable'
+      : `Exact reply ${page + 1}/${pages.length} | Not sent`
+  return pageWithZones('draft', appHeader(state, alert, stale ? 'Case changed' : !supported ? 'Unsupported characters' : ''), pages[page],
+    `Reviewed ${reviewedPages}/${pages.length} pages`,
+    page + 1 < pages.length ? 'Swipe to continue' : 'Swipe to confirm', {
       menu: [
-        ...(page > 0 ? [[G2_MENU.approvalPrevious, 'Previous text page'] as const] : []),
-        ...(page + 1 < pages.length ? [[G2_MENU.approvalNext, 'Next text page'] as const] : []),
+        ...(page > 0 ? [[G2_MENU.approvalPrevious, 'Previous page'] as const] : []),
+        ...(page + 1 < pages.length ? [[G2_MENU.approvalNext, 'Next page'] as const] : []),
         [G2_MENU.approvalCancel, 'Cancel review'],
-      ], key: `approval-review-${pages.length}`,
+      ], key: `approval-review-${pages.length}-${stale ? 'stale' : 'fresh'}`,
     })
 }
 
 function replyPage(state: GlassesState): GlassesPage {
   const item = state.caseData
   const reply = state.reply
-  if (!reply || !item) return pageWithText('reply-status', appHeader(state, 'REPLY STATUS'),
-    'CHECKING REPLY STATUS\n\nNO DELIVERY CLAIM IS MADE', 'WAIT FOR BACKEND STATUS')
+  if (!reply || !item) return pageWithText('reply-status', appHeader(state, 'Reply status'),
+    'Checking reply status\n\nNo delivery claim is made', 'Wait for backend status')
   const presentation = presentReplyState(reply.state, item.channel)
   const label: Record<string, string> = {
-    queued: 'QUEUED\nWAITING FOR DISPATCH\nNOT SENT YET',
-    sending: 'SENDING\nPROVIDER REQUEST IN PROGRESS',
-    submitted: `SUBMITTED TO ${item.channel.toUpperCase()}\nDELIVERY NOT CONFIRMED`,
-    delivered: 'DELIVERY RECEIPT CONFIRMED',
-    failed: 'FAILED TO SEND',
-    unknown: 'STATUS UNCERTAIN\nCUSTOMER MAY HAVE RECEIVED IT\nDO NOT RETRY',
-    cancelled: 'CANCELLED BEFORE DISPATCH\nNOT SENT',
+    queued: 'Queued\nWaiting for dispatch\nNot sent yet',
+    sending: 'Sending\nProvider request in progress',
+    submitted: `Submitted to ${channelLabel(item.channel)}\nDelivery not confirmed`,
+    delivered: 'Delivery receipt confirmed',
+    failed: 'Failed to send',
+    unknown: 'Status uncertain\nCustomer may have received it\nDo not retry',
+    cancelled: 'Cancelled before dispatch\nNot sent',
   }
+  const statusMark = reply.state === 'queued' ? G2_MARK.pending :
+    reply.state === 'sending' ? G2_MARK.selected :
+      reply.state === 'failed' || reply.state === 'unknown' || (item.channel === 'telegram' && reply.state === 'delivered')
+        ? G2_MARK.warning : reply.state === 'cancelled' ? G2_MARK.stop : G2_MARK.accepted
   const statusLabel = item.channel === 'telegram' && reply.state === 'delivered'
-    ? 'DELIVERY UNVERIFIABLE\nTELEGRAM RECEIPTS NOT SUPPORTED'
+    ? 'Delivery unverifiable\nTelegram receipts not supported'
     : label[reply.state]
-  const actions = ['CHECK STATUS', 'RESOLVE CASE', 'BACK TO CASE']
-  const selected = Math.min(state.focusedAction, actions.length - 1)
-  return pageWithText('reply-status', appHeader(state, 'REPLY OUTCOME'),
-    `${statusLabel}\n\n${wrapGlassesPreview(presentation.detail.toUpperCase(), 2, 48)}\nCASE ${item.version}  |  ${reply.reply_id.slice(0, 8).toUpperCase()}`,
-    `ACTION  ${selected + 1}/${actions.length}  > ${actions[selected]}  |  DOUBLE SELECT`, {
+  return pageWithZones('reply-status', appHeader(state, `Reply outcome | ${compactLine(item.customer_label, 18)}`),
+    `${statusMark} ${statusLabel}\n${wrapGlassesPreview(presentation.detail, 2, CHARS_PER_LINE - 4)}`,
+    `Case v${item.version}`, 'Use menu for actions', {
       menu: [[G2_MENU.statusCheck, 'Check status'], [G2_MENU.statusResolve, 'Resolve case'], [G2_MENU.statusCase, 'Back to case']],
+      key: `status-${reply.state}`,
     })
 }
 
 const RESOLVE_REASONS = [
-  ['handled_in_person', 'HANDLED IN PERSON', G2_MENU.reasonHandled],
-  ['customer_updated', 'CUSTOMER UPDATED', G2_MENU.reasonUpdated],
-  ['no_action_needed', 'NO ACTION NEEDED', G2_MENU.reasonNoAction],
-  ['other', 'OTHER', G2_MENU.reasonOther],
+  ['handled_in_person', 'Handled in person', G2_MENU.reasonHandled],
+  ['customer_updated', 'Customer updated', G2_MENU.reasonUpdated],
+  ['no_action_needed', 'No action needed', G2_MENU.reasonNoAction],
+  ['other', 'Other', G2_MENU.reasonOther],
 ] as const
 
 function resolvePage(state: GlassesState): GlassesPage {
   const item = state.caseData
-  if (!item) return pageWithText('resolve', appHeader(state, 'RESOLVE'), 'NO CASE SELECTED', 'BACK TO CASE')
+  if (!item) return pageWithZones('resolve', appHeader(state, 'Resolve'), 'No case selected.', '', 'Use menu to go back', {
+    menu: [[G2_MENU.resolveCancel, 'Cancel']], key: 'none',
+  })
   const reasonIndex = Math.max(0, RESOLVE_REASONS.findIndex(([value]) => value === state.resolveReason))
   const unknown = item.latest_reply?.state === 'unknown'
-  const actions = unknown && !state.acknowledgedUnknown
-    ? ['ACKNOWLEDGE UNCERTAINTY', 'CANCEL']
-    : ['CONFIRM RESOLVE', 'CANCEL']
-  const selected = Math.min(state.focusedAction, actions.length - 1)
-  const warning = unknown
-    ? `UNKNOWN REPLY\nCUSTOMER MAY OR MAY NOT HAVE RECEIVED IT${state.acknowledgedUnknown ? '\nACKNOWLEDGED' : ''}`
-    : item.latest_reply?.state === 'queued'
-      ? 'QUEUED REPLY WILL BE CANCELLED\nIT WILL NOT BE SENT'
-      : item.latest_reply?.state === 'sending'
-        ? 'REPLY IS SENDING\nRESOLUTION WILL BE REJECTED'
-        : ''
+  const name = compactLine(item.customer_label, 18)
+  const replyState = item.latest_reply?.state
+  const needsAck = unknown && !state.acknowledgedUnknown
+  const warning = unknown ? state.acknowledgedUnknown ? 'Unknown reply acknowledged' : 'Delivery unknown'
+    : replyState === 'queued' ? 'Queued reply cancels'
+      : replyState === 'sending' ? 'Reply is sending' : ''
+  const header = `${warning ? `${G2_MARK.warning} ${warning} | ` : ''}Resolve ${name}?`
+  if (needsAck) return pageWithZones('resolve', appHeader(state, 'Resolve case?', 'Reply outcome uncertain'),
+    'Customer may or may not have received it.\nDo not retry the reply.',
+    `Case v${item.version}`, 'Use menu to acknowledge', {
+      emphasis: true,
+      menu: [[G2_MENU.resolveAcknowledge, 'Acknowledge uncertainty'], [G2_MENU.resolveCancel, 'Cancel']],
+      key: 'resolve-unknown-ack',
+    })
+
   const menu: MenuEntry[] = RESOLVE_REASONS.map(([, label, id]) => [id, label])
-  if (unknown && !state.acknowledgedUnknown) menu.push([G2_MENU.resolveAcknowledge, 'Acknowledge uncertainty'])
-  else menu.push([G2_MENU.resolveConfirm, 'Confirm resolution'])
+  menu.push([G2_MENU.resolveConfirm, 'Confirm resolve'])
   menu.push([G2_MENU.resolveCancel, 'Cancel'])
-  return pageWithText('resolve', appHeader(state, 'RESOLVE CASE'),
-    `${compactLine(item.customer_label.toUpperCase(), 40)}  |  V${item.version}\nREASON ${reasonIndex + 1}/4\n${RESOLVE_REASONS[reasonIndex][1]}${warning ? `\n\n${warning}` : ''}`,
-    `ACTION  ${selected + 1}/${actions.length}  > ${actions[selected]}  |  SWIPE REASON`, { menu })
+  const warningDetail = state.acknowledgedUnknown ? 'Uncertainty acknowledged. The customer may have received the reply.'
+    : replyState === 'queued' ? 'Queued reply will be cancelled and not sent.'
+      : replyState === 'sending' ? 'Reply is sending. Wait before resolving.' : ''
+  return pageWithChoices('resolve', appHeader(state, header), RESOLVE_REASONS.map(([, label]) => label),
+    `Reason ${reasonIndex + 1}/${RESOLVE_REASONS.length}${state.resolveReason === 'other' && state.resolveNote ? ` | ${compactLine(state.resolveNote, 12)}` : ''}`,
+    'Use menu to confirm', menu, `resolve-${warning ? 'warn' : 'ok'}-ack-${state.acknowledgedUnknown}`, warningDetail)
 }
 
 export function buildGlassesPage(state: GlassesState): GlassesPage {
-  if (state.screen === 'pair') return pageWithText('pair', appHeader(state, 'PAIR'),
-    'OWNER SESSION REQUIRED\n\nPAIR THIS DEVICE WITH TELEGRAM\nON THE COMPANION APP', 'PAIRING IS NOT AVAILABLE HERE')
+  if (state.screen === 'pair') return pageWithText('pair', appHeader(state, 'Pair'),
+    'Owner session required\n\nPair this device with Telegram\non the companion app', 'Pairing is not available here')
   if (state.screen === 'inbox') return inboxPage(state)
+  if (state.screen === 'schedule') return schedulePage(state)
   if (state.screen === 'case') return casePage(state)
   if (state.screen === 'voice') return voicePage(state)
   if (state.screen === 'draft') return draftPage(state)
   if (state.screen === 'approval') return approvalPage(state)
   if (state.screen === 'status') return replyPage(state)
   if (state.screen === 'resolve') return resolvePage(state)
-  return pageWithText('loading', appHeader(state, 'GLANCE'), 'LOADING', 'PLEASE WAIT')
+  return pageWithText('loading', appHeader(state, 'Glance'), 'Loading', 'Please wait')
 }
 
 export function glassesPageText(page: GlassesPage): string {
@@ -582,7 +854,8 @@ export function glassesPageToPayload(page: GlassesPage): {
 export function glassesPagesHaveSameLayout(left: GlassesPage, right: GlassesPage): boolean {
   if (left.layoutKey !== right.layoutKey) return false
   if (JSON.stringify(left.menuObject?.menuItems ?? []) !== JSON.stringify(right.menuObject?.menuItems ?? [])) return false
-  if (left.layoutKey !== 'list') return true
+  if (!left.listObject && !right.listObject) return true
+  if (!left.listObject || !right.listObject) return false
   const leftItems = left.listObject?.[0]?.itemContainer?.itemName ?? []
   const rightItems = right.listObject?.[0]?.itemContainer?.itemName ?? []
   return leftItems.length === rightItems.length && leftItems.every((item, index) => item === rightItems[index])

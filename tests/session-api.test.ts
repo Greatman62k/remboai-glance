@@ -134,6 +134,7 @@ test('all Glance API methods use the backend route and request contracts', async
   const responseFor = (path: string): unknown => {
     if (path === '/pairing/exchange') return session('route-test-token')
     if (path === '/inbox?limit=20') return { items: [], open_count: 0, has_more: false, next_cursor: null }
+    if (path === '/attention?limit=50') return { items: [], count: 0, has_more: false, next_cursor: null }
     if (path === `/cases/${caseId}`) return { case_id: caseId, version: 3, status: 'open', category: 'human_request', channel: 'telegram', customer_label: 'Amina', latest_reply: null, has_earlier: false, context: [] }
     if (path === `/cases/${caseId}/status`) return { case_id: caseId, version: 3, status: 'open', latest_reply: null, case_updated_at: new Date().toISOString() }
     if (path === `/cases/${caseId}/drafts` || path === `/cases/${caseId}/drafts/manual` || path === `/cases/${caseId}/drafts/${draftId}/revise`) return { draft_id: draftId, based_on_version: 3, text: 'Exact customer text.', source: 'ai', expires_at: new Date(Date.now() + 60_000).toISOString() }
@@ -156,6 +157,7 @@ test('all Glance API methods use the backend route and request contracts', async
   const paired = await client.exchangePairing('0123456789AB', 'G2 device')
   store.save(paired)
   await client.getInbox()
+  await client.getAttention()
   await client.getCase(caseId)
   await client.getCaseStatus(caseId)
   await client.createDraft(caseId, 3, '33333333-3333-4333-8333-333333333333')
@@ -167,18 +169,18 @@ test('all Glance API methods use the backend route and request contracts', async
   await client.revokeCurrentSession()
 
   assert.deepEqual(calls.map((call) => [new URL(call.url).pathname.replace('/api/v1/glance', ''), call.init.method]), [
-    ['/pairing/exchange', 'POST'], ['/inbox', 'GET'], [`/cases/${caseId}`, 'GET'], [`/cases/${caseId}/status`, 'GET'],
+    ['/pairing/exchange', 'POST'], ['/inbox', 'GET'], ['/attention', 'GET'], [`/cases/${caseId}`, 'GET'], [`/cases/${caseId}/status`, 'GET'],
     [`/cases/${caseId}/drafts`, 'POST'], [`/cases/${caseId}/drafts/manual`, 'POST'],
     [`/cases/${caseId}/drafts/${draftId}/revise`, 'POST'], [`/cases/${caseId}/replies`, 'POST'],
     [`/replies/${replyId}`, 'GET'], [`/cases/${caseId}/resolve`, 'POST'], ['/sessions/current', 'DELETE'],
   ])
-  assert.deepEqual(calls[4].body, { expected_version: 3 })
-  assert.deepEqual(calls[5].body, { expected_version: 3, text: 'Owner text.' })
-  assert.deepEqual(calls[6].body, { expected_version: 3, instruction: 'Make it shorter.' })
-  assert.deepEqual(calls[7].body, { expected_version: 3, draft_id: draftId, text: 'Exact customer text.' })
-  assert.equal(new Headers(calls[4].init.headers).get('Idempotency-Key'), '33333333-3333-4333-8333-333333333333')
-  assert.equal(new Headers(calls[7].init.headers).get('Idempotency-Key'), '66666666-6666-4666-8666-666666666666')
+  assert.deepEqual(calls[5].body, { expected_version: 3 })
+  assert.deepEqual(calls[6].body, { expected_version: 3, text: 'Owner text.' })
+  assert.deepEqual(calls[7].body, { expected_version: 3, instruction: 'Make it shorter.' })
+  assert.deepEqual(calls[8].body, { expected_version: 3, draft_id: draftId, text: 'Exact customer text.' })
+  assert.equal(new Headers(calls[5].init.headers).get('Idempotency-Key'), '33333333-3333-4333-8333-333333333333')
+  assert.equal(new Headers(calls[8].init.headers).get('Idempotency-Key'), '66666666-6666-4666-8666-666666666666')
   assert.equal(calls[0].body?.salon_id, undefined)
-  assert.equal(calls[7].body?.recipient, undefined)
+  assert.equal(calls[8].body?.recipient, undefined)
   assert.equal(store.load(), null)
 })

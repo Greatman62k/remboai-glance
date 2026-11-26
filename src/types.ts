@@ -36,6 +36,49 @@ export interface InboxData {
   next_cursor: null
 }
 
+export interface AttentionItem {
+  attention_id: string
+  kind: string
+  priority: 'critical' | 'high' | 'normal' | 'low' | string
+  state: string
+  title: string
+  summary: string
+  created_at: string
+  expires_at: string | null
+  case_id: string | null
+  resource_id: string | null
+  action: string
+}
+
+export interface AttentionData {
+  items: AttentionItem[]
+  count: number
+  has_more: boolean
+  next_cursor: string | null
+}
+
+export type SchedulePaymentState = 'paid' | 'awaiting_deposit' | 'no_deposit_recorded'
+
+export interface ScheduleItem {
+  booking_id: string
+  status: 'confirmed' | 'held' | string
+  customer_label: string
+  service: string
+  staff: string
+  starts_at: string
+  ends_at: string
+  payment_state: SchedulePaymentState | string
+}
+
+export interface ScheduleData {
+  date: string
+  timezone: string
+  items: ScheduleItem[]
+  count: number
+  has_more: boolean
+  next_offset: number | null
+}
+
 export interface LatestReply {
   reply_id: string
   state: ReplyState

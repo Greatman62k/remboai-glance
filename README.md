@@ -47,7 +47,7 @@ evenhub-simulator http://127.0.0.1:5173 --automation-port 9898 --no-glow
 
 The simulator exposes a 576 × 288 G2 display. Its `/api/ping` endpoint only means the simulator process is ready; it does not mean the WebView, Even Hub bridge, startup page, or framebuffer is ready. Wait until the phone WebView reports `G2 connected · 576 × 288` or the glasses screenshot contains a rendered frame before capturing. This prevents a screenshot taken during startup from being mistaken for a blank app page.
 
-In a development build, render synthetic G2 states by adding `?g2-preview=` to the simulator URL: `inbox`, `case`, `case-older`, `draft`, `voice-ready`, `voice-recording`, `transcript-preview`, `approval-review`, `approval-confirm`, `reply-status`, `resolve`, or `case-resolved`. For example:
+In a development build, render synthetic G2 states by adding `?g2-preview=` to the simulator URL: `inbox`, `schedule`, `case`, `case-older`, `draft`, `voice-ready`, `voice-recording`, `transcript-preview`, `approval-review`, `approval-confirm`, `reply-status`, `resolve`, or `case-resolved`. For example:
 
 ```sh
 evenhub-simulator 'http://127.0.0.1:5173/?g2-preview=voice-recording' --automation-port 9898 --no-glow
@@ -59,7 +59,7 @@ These routes use synthetic fixtures, skip saved-session loading and backend poll
 
 - `src/main.ts` waits for the Even Hub bridge, validates and creates/rebuilds native pages, upgrades stable text containers, and forwards SDK events through one shared handler.
 - `src/glasses-ui.ts` builds bounded native 576 × 288 screen layouts using absolute SDK container geometry.
-- `src/app.ts` coordinates the G2-first inbox, case, voice, draft, exact-text review, reply-status and resolution workflow.
+- `src/app.ts` coordinates the G2-first inbox, read-only daily schedule, case, voice, draft, exact-text review, reply-status and resolution workflow.
 - `src/client.ts` implements the typed `/api/v1/glance` requests, including authenticated raw PCM transcription, bearer handling, timeouts, request IDs, `Retry-After`, and no-store fetches.
 - `src/session.ts` validates pairing codes and stores the revocable session token in browser `localStorage` until expiry or revocation.
 - `src/workflow.ts` contains presentation helpers and payload-bound pending idempotency keys. A pending write retains its action key and exact payload in `localStorage` until success, so an uncertain retry after WebView suspension reuses the same key; successful actions clear the record.
@@ -71,7 +71,8 @@ These routes use synthetic fixtures, skip saved-session loading and backend poll
 The API client calls:
 
 - `POST /pairing/exchange` and `DELETE /sessions/current`
-- `GET /inbox?limit=20` and `GET /cases/{case_id}`
+- `GET /attention?limit=50`, `GET /inbox?limit=20`, and `GET /cases/{case_id}`
+- `GET /schedule?limit=20&offset=0` for the authenticated owner's salon-local program of the day
 - `POST /cases/{case_id}/drafts`, `/drafts/manual`, and `/drafts/{draft_id}/revise`
 - `POST /cases/{case_id}/replies` and `GET /replies/{reply_id}`
 - `POST /cases/{case_id}/resolve`

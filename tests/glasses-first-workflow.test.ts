@@ -185,12 +185,13 @@ test('G2 can create and review a persisted display-safe copy without using the p
     await flow.click(0)
     await flow.double() // Generate an AI suggestion with unsupported display glyphs.
     assert.equal(flow.app.state.screen, 'draft')
-    assert.match(flow.text(), /ACTION  1\/4  > REVIEW EXACT REPLY/)
+    assert.match(JSON.stringify(flow.app.getGlassesPage().menuObject), /Review reply/)
 
     await flow.click()
     await flow.click()
     await flow.click()
-    assert.match(flow.text(), /ACTION  4\/4  > CREATE ASCII COPY/)
+    assert.equal(flow.app.state.focusedAction, 3)
+    assert.match(JSON.stringify(flow.app.getGlassesPage().menuObject), /ASCII copy/)
     await flow.double()
 
     assert.equal(flow.app.state.screen, 'draft')
@@ -202,10 +203,10 @@ test('G2 can create and review a persisted display-safe copy without using the p
     await flow.double() // Review starts again on the persisted copy.
     assert.equal(flow.app.state.screen, 'approval')
     assert.match(flow.text(), /I\'m available - please call "Amina"\./)
-    assert.match(flow.text(), /PROGRESS 0\/1 PAGES COMPLETE/)
+    assert.match(flow.text(), /Reviewed 0\/1 pages/)
     await flow.down()
     assert.equal(flow.app.state.approvalStage, 'confirm')
-    assert.doesNotMatch(flow.text(), /UNSUPPORTED DISPLAY CHARACTERS/)
+    assert.doesNotMatch(flow.text(), /Unsupported display characters/)
     await flow.double()
     assert.equal(flow.calls.filter((call) => call.name === 'approveReply').length, 1)
   } finally {
@@ -224,15 +225,15 @@ test('G2 recovers a lost approval response from latest reply without a second ap
     await flow.double() // The server commits, but the response is lost.
 
     assert.equal(flow.app.state.screen, 'approval')
-    assert.match(flow.text(), /OUTCOME UNCERTAIN/)
-    assert.match(flow.text(), /CHECK STATUS/)
-    assert.match(JSON.stringify(flow.app.getGlassesPage().menuObject), /Retry same approval key/)
+    assert.match(flow.text(), /Outcome uncertain/)
+    assert.match(flow.text(), /Check status/)
+    assert.match(JSON.stringify(flow.app.getGlassesPage().menuObject), /Retry same key/)
     assert.equal(flow.calls.filter((call) => call.name === 'approveReply').length, 1)
 
     await flow.double() // Recover latest_reply and its scoped status.
     assert.equal(flow.app.state.screen, 'status')
     assert.equal(flow.app.state.reply?.state, 'queued')
-    assert.match(flow.text(), /QUEUED/)
+    assert.match(flow.text(), /Queued/)
     assert.equal(flow.calls.filter((call) => call.name === 'approveReply').length, 1)
     assert.equal(flow.calls.filter((call) => call.name === 'getReply').length, 1)
   } finally {
@@ -245,10 +246,10 @@ test('G2-only workflow opens context, drafts by voice, reviews exact pages, queu
   try {
     await flow.click(0)
     assert.equal(flow.app.state.screen, 'case')
-    assert.match(flow.text(), /MSG 1\/10/)
+    assert.match(flow.text(), /Message 1\/10/)
     const newest = flow.text()
     await flow.up()
-    assert.match(flow.text(), /MSG 2\/10/)
+    assert.match(flow.text(), /Message 2\/10/)
     assert.notEqual(flow.text(), newest)
     await flow.down()
     assert.equal(flow.text(), newest)
@@ -256,7 +257,7 @@ test('G2-only workflow opens context, drafts by voice, reviews exact pages, queu
     await flow.double() // Generate an AI suggestion.
     assert.equal(flow.app.state.screen, 'draft')
     assert.equal(flow.app.state.draft?.source, 'ai')
-    assert.match(flow.text(), /AI SUGGESTION/)
+    assert.match(flow.text(), /AI draft \| Not sent/)
     assert.equal(flow.calls.filter((call) => call.name === 'createDraft').length, 1)
 
     await flow.click() // Select Dictate revision/reply.
@@ -264,12 +265,13 @@ test('G2-only workflow opens context, drafts by voice, reviews exact pages, queu
     assert.equal(flow.app.state.screen, 'voice')
     assert.equal(flow.app.state.voicePhase, 'idle')
     assert.deepEqual(flow.audioCalls, [])
-    assert.match(flow.text(), /MICROPHONE OFF/)
+    assert.match(flow.text(), /Mic off/)
+    assert.match(JSON.stringify(flow.app.getGlassesPage().menuObject), /Start recording/)
 
     await flow.double() // Explicit START.
     assert.equal(flow.app.state.voicePhase, 'recording')
     assert.deepEqual(flow.audioCalls, [{ open: true, source: AudioInputSource.Glasses }])
-    assert.match(flow.text(), /G2 MIC ACTIVE/)
+    assert.match(flow.text(), /Recording/)
     await flow.audio()
     await flow.double() // Explicit STOP and transcribe.
     assert.equal(flow.app.state.voicePhase, 'transcript_ready')
@@ -290,13 +292,13 @@ test('G2-only workflow opens context, drafts by voice, reviews exact pages, queu
     assert.equal(flow.app.state.approvalStage, 'review')
     const pages = paginateGlassesApprovalText(flow.app.state.approvalText).length
     assert.ok(pages > 1)
-    assert.match(flow.text(), /REPLY 1\//)
+    assert.match(flow.text(), /Exact reply 1\//)
     assert.match(flow.text(), /word000/)
     for (let page = 1; page < pages; page += 1) {
       await flow.down()
       assert.equal(flow.app.state.approvalStage, 'review')
       assert.equal(flow.app.state.approvalPage, page)
-      assert.match(flow.text(), new RegExp(`REPLY ${page + 1}\\/`))
+      assert.match(flow.text(), new RegExp(`Exact reply ${page + 1}\\/`))
     }
     assert.match(flow.text(), /word069/)
     assert.equal(flow.calls.some((call) => call.name === 'approveReply'), false)
@@ -308,9 +310,9 @@ test('G2-only workflow opens context, drafts by voice, reviews exact pages, queu
     assert.equal(flow.calls.filter((call) => call.name === 'approveReply').length, 1)
     const approval = flow.calls.find((call) => call.name === 'approveReply')!
     assert.equal(approval.args[3], transcript)
-    assert.match(flow.text(), /QUEUED/)
-    assert.match(flow.text(), /NOT SENT YET/)
-    assert.doesNotMatch(flow.text(), /DELIVERED/)
+    assert.match(flow.text(), /Queued/)
+    assert.match(flow.text(), /Not sent yet/)
+    assert.doesNotMatch(flow.text(), /Delivered/)
     assert.equal(flow.app.state.caseData?.version, 6)
 
     await flow.click() // Select resolve from reply status.
@@ -318,15 +320,15 @@ test('G2-only workflow opens context, drafts by voice, reviews exact pages, queu
     assert.equal(flow.app.state.screen, 'resolve')
     assert.equal(flow.app.state.focusedAction, 0)
     await flow.down() // Select a reason without opening the phone.
-    assert.match(flow.text(), /CUSTOMER UPDATED/)
+    assert.match(flow.text(), /Customer updated/)
     assert.equal(flow.calls.filter((call) => call.name === 'resolveCase').length, 0)
     await flow.double()
     assert.equal(flow.calls.filter((call) => call.name === 'resolveCase').length, 1)
     assert.equal((flow.calls.find((call) => call.name === 'resolveCase')!.args[1] as { reason: string }).reason, 'customer_updated')
     assert.equal(flow.currentCase().version, 7)
     assert.equal(flow.currentCase().status, 'resolved')
-    assert.match(flow.text(), /CANCELLED/)
-    assert.match(flow.text(), /NOT SENT/)
+    assert.match(flow.text(), /Cancelled/)
+    assert.match(flow.text(), /not sent/)
     assert.deepEqual(flow.calls.filter((call) => ['transcribeAudio', 'createManualDraft', 'approveReply', 'resolveCase'].includes(call.name)).map((call) => call.name), [
       'transcribeAudio', 'createManualDraft', 'approveReply', 'resolveCase',
     ])
@@ -392,12 +394,12 @@ test('G2 unknown-send resolution needs a distinct acknowledgement before the res
     await flow.click(0)
     flow.app.state.focusedAction = 3
     await flow.double()
-    assert.match(flow.text(), /CUSTOMER MAY OR MAY NOT HAVE RECEIVED IT/)
+    assert.match(flow.text(), /Customer may or may not have received it/)
     assert.equal(flow.calls.filter((call) => call.name === 'resolveCase').length, 0)
     await flow.double()
     assert.equal(flow.app.state.acknowledgedUnknown, true)
     assert.equal(flow.calls.filter((call) => call.name === 'resolveCase').length, 0)
-    assert.match(flow.text(), /ACKNOWLEDGED/)
+    assert.match(flow.text(), /acknowledged/i)
     await flow.double()
     const request = flow.calls.find((call) => call.name === 'resolveCase')
     assert.ok(request)

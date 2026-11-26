@@ -190,13 +190,65 @@ export function categoryLabel(category: string): string {
     complaint: 'Complaint',
     deposit: 'Deposit question',
     payment_dispute: 'Payment question',
-    emergency: 'Urgent request',
+    emergency: 'Emergency',
     legal: 'Sensitive request',
     medical: 'Sensitive request',
     harassment: 'Sensitive request',
     privacy: 'Privacy request',
   }
   return labels[category] ?? 'Needs owner'
+}
+
+export type CaseAttentionTier = 'urgent' | 'sensitive' | 'review'
+
+/**
+ * Keep urgency explicit without changing the backend's oldest-first ordering.
+ * The inbox can therefore draw attention to risk while preserving its queue
+ * semantics.
+ */
+export function caseAttentionTier(category: string): CaseAttentionTier {
+  if (category === 'emergency') return 'urgent'
+  if (['legal', 'medical', 'harassment', 'privacy', 'payment_dispute', 'complaint'].includes(category)) return 'sensitive'
+  return 'review'
+}
+
+export function caseAttentionLabel(category: string): string {
+  switch (caseAttentionTier(category)) {
+    case 'urgent': return 'Urgent'
+    case 'sensitive': return 'Sensitive'
+    case 'review': return 'Needs review'
+  }
+}
+
+export interface CaseAttentionCounts {
+  urgent: number
+  sensitive: number
+  review: number
+}
+
+export function caseAttentionCounts(items: readonly Pick<InboxItem, 'category'>[]): CaseAttentionCounts {
+  return items.reduce<CaseAttentionCounts>((counts, item) => {
+    counts[caseAttentionTier(item.category)] += 1
+    return counts
+  }, { urgent: 0, sensitive: 0, review: 0 })
+}
+
+/** Select the most attention-worthy visible case without changing inbox order. */
+export function prioritizedCaseIndex(items: readonly Pick<InboxItem, 'category'>[]): number {
+  if (!items.length) return 0
+  const rank = (category: string): number => {
+    switch (caseAttentionTier(category)) {
+      case 'urgent': return 0
+      case 'sensitive': return 1
+      case 'review': return 2
+    }
+  }
+  return items.reduce((best, item, index) =>
+    rank(item.category) < rank(items[best].category) ? index : best, 0)
+}
+
+export function channelLabel(channel: string): string {
+  return channel === 'telegram' ? 'Telegram' : channel === 'whatsapp' ? 'WhatsApp' : channel
 }
 
 export function summarizeCase(caseData: CaseData): string {

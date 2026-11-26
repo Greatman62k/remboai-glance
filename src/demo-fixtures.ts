@@ -1,5 +1,6 @@
 import { ApiError } from './client.ts'
 import type {
+  AttentionData,
   CaseData,
   CaseStatusData,
   DraftData,
@@ -9,6 +10,8 @@ import type {
   ReplyResult,
   ResolveRequest,
   ResolveResult,
+  ScheduleData,
+  ScheduleItem,
   SessionData,
   TranscriptionData,
 } from './types.ts'
@@ -86,6 +89,28 @@ const fixtureItems: InboxItem[] = [
 ]
 
 const unknownReplyId = '0d3780c3-d5a2-4144-9425-d648049f11d9'
+
+function fixtureSchedule(): ScheduleItem[] {
+  const today = new Date()
+  const day = today.toISOString().slice(0, 10)
+  return [
+    {
+      booking_id: 'fixture-booking-1', status: 'confirmed', customer_label: 'Amina',
+      service: 'Haircut', staff: 'Brian', starts_at: `${day}T08:30:00.000Z`, ends_at: `${day}T09:15:00.000Z`,
+      payment_state: 'paid',
+    },
+    {
+      booking_id: 'fixture-booking-2', status: 'confirmed', customer_label: 'Nia',
+      service: 'Colour touch-up', staff: 'Joy', starts_at: `${day}T10:00:00.000Z`, ends_at: `${day}T11:30:00.000Z`,
+      payment_state: 'no_deposit_recorded',
+    },
+    {
+      booking_id: 'fixture-booking-3', status: 'held', customer_label: 'Kendi',
+      service: 'Walk-in consultation', staff: 'Brian', starts_at: `${day}T13:00:00.000Z`, ends_at: `${day}T13:30:00.000Z`,
+      payment_state: 'awaiting_deposit',
+    },
+  ]
+}
 
 export class DemoFixtures {
   readonly mode = 'development-fixtures' as const
@@ -169,6 +194,37 @@ export class DemoFixtures {
     return { items, open_count: items.length, has_more: false, next_cursor: null }
   }
 
+  async getAttention(limit = 50): Promise<AttentionData> {
+    const boundedLimit = Math.min(50, Math.max(1, Math.floor(limit)))
+    const items = (await this.getInbox()).items.slice(0, boundedLimit).map((item) => ({
+      attention_id: `case:${item.case_id}`,
+      kind: 'escalation',
+      priority: item.category === 'complaint' ? 'high' : 'normal',
+      state: 'open',
+      title: `Customer escalation · ${item.customer_label}`,
+      summary: `${item.channel} · ${item.preview}`,
+      created_at: item.created_at,
+      expires_at: null,
+      case_id: item.case_id,
+      resource_id: item.case_id,
+      action: 'open_case',
+    }))
+    return { items, count: items.length, has_more: false, next_cursor: null }
+  }
+
+  async getSchedule(limit = 20, offset = 0): Promise<ScheduleData> {
+    const items = fixtureSchedule()
+    const page = items.slice(offset, offset + limit)
+    return {
+      date: new Date().toISOString().slice(0, 10),
+      timezone: 'UTC',
+      items: page,
+      count: page.length,
+      has_more: offset + page.length < items.length,
+      next_offset: offset + page.length < items.length ? offset + page.length : null,
+    }
+  }
+
   async getCase(caseId: string): Promise<CaseData> {
     const item = this.cases.get(caseId)
     if (!item) throw new ApiError('case_not_found', 404, 'Synthetic case not found.')
@@ -232,7 +288,7 @@ export class DemoFixtures {
       const current = await this.requireCurrentCase(caseId, expectedVersion)
       const hasRequestedTime = /\b(5|five|17:00)\b/i.test(instruction)
       const text = hasRequestedTime
-        ? "I'm checking the current walk-in availability before confirming a time. I'll update you shortly."
+        ? 'Yes, walk-ins are accepted until 5:00 p.m. this afternoon. Please come before then and our team will help you as soon as a chair is available. There may be a short wait while we finish with the clients already here. If you can share your expected arrival time, we can let the team know and be ready to assist. We look forward to seeing you.'
         : "Thanks for your message. I'm checking the details and will update you shortly."
       const draft: DraftData = {
         draft_id: crypto.randomUUID(),
