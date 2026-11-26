@@ -28,6 +28,7 @@ Glance does not mirror a messaging app on smart glasses. It gives a busy owner a
 - [Reply state and safety](#reply-state-and-safety)
 - [Design decisions](#design-decisions)
 - [Architecture](#architecture)
+- [Project structure](#project-structure)
 - [Technology](#technology)
 - [Run the Glance client locally](#run-the-glance-client-locally)
 - [Verification and limitations](#verification-and-limitations)
@@ -299,6 +300,70 @@ The client is configured against the `/api/v1/glance` API root and uses the foll
 | `POST /cases/{case_id}/resolve` | Resolve the case through the backend's guarded workflow |
 
 The paired session is the authority boundary. The client uses bearer authentication, omits cookies, and requests `no-store` responses. The browser-stored bearer token is revocable but is not a native Keychain or Keystore secret. See [Security notes](#security-notes).
+
+## Project structure
+
+This tree is generated from files known to Git. After adding, removing, or moving project files, run `npm run docs:tree` and commit the refreshed README.
+
+<!-- PROJECT_TREE:START -->
+```text
+remboai-glance/
+├── docs/
+│   ├── glasses-first-captures/
+│   │   └── [16 visual assets]
+│   └── glasses-first-workflow.md
+├── public/
+│   ├── favicon.svg
+│   └── icons.svg
+├── scripts/
+│   └── update-readme-tree.mjs
+├── src/
+│   ├── assets/
+│   │   ├── typescript.svg
+│   │   ├── vite.svg
+│   │   └── [1 visual assets]
+│   ├── app.ts
+│   ├── audio-capture.ts
+│   ├── client.ts
+│   ├── config.ts
+│   ├── counter.ts
+│   ├── demo-fixtures.ts
+│   ├── display-writer.ts
+│   ├── evenhub-events.ts
+│   ├── g2-preview.ts
+│   ├── glasses-ui.ts
+│   ├── main.ts
+│   ├── runtime-metrics.ts
+│   ├── session.ts
+│   ├── state-view.ts
+│   ├── style.css
+│   ├── types.ts
+│   ├── voice-intents.ts
+│   ├── workflow.ts
+│   └── workspace.ts
+├── tests/
+│   ├── audio-capture.test.ts
+│   ├── backend-integration.ts
+│   ├── display-writer.test.ts
+│   ├── glasses-first-workflow.test.ts
+│   ├── glasses-ui.test.ts
+│   ├── session-api.test.ts
+│   ├── transcription-api.test.ts
+│   ├── voice-controller.test.ts
+│   ├── voice-intents.test.ts
+│   ├── workflow.test.ts
+│   └── workspace.test.ts
+├── .env.example
+├── .gitignore
+├── LICENSE
+├── README.md
+├── app.json
+├── index.html
+├── package-lock.json
+├── package.json
+└── tsconfig.json
+```
+<!-- PROJECT_TREE:END -->
 
 ## Technology
 
