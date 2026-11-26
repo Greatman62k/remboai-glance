@@ -1,4 +1,4 @@
-import { FIXTURE_CASE_ID } from './demo-fixtures.ts'
+import { FIXTURE_CASE_ID, FIXTURE_UNKNOWN_CASE_ID } from './demo-fixtures.ts'
 import type { GlanceAppController } from './app.ts'
 import type { ReplyData } from './types.ts'
 import { CONTEXT_PAGE_SIZE } from './workflow.ts'
@@ -16,7 +16,9 @@ export type G2PreviewName =
   | 'approval-review'
   | 'approval-confirm'
   | 'reply-status'
+  | 'reply-unknown'
   | 'resolve'
+  | 'resolve-unknown'
   | 'case-resolved'
 
 const ROUTES: G2PreviewName[] = [
@@ -31,7 +33,9 @@ const ROUTES: G2PreviewName[] = [
   'approval-review',
   'approval-confirm',
   'reply-status',
+  'reply-unknown',
   'resolve',
+  'resolve-unknown',
   'case-resolved',
 ]
 
@@ -146,7 +150,22 @@ export async function prepareG2Preview(app: GlanceAppController, route: G2Previe
       app.state.screen = 'status'
       break
     }
+    case 'reply-unknown': {
+      app.state.caseData = await app.fixtures.getCase(FIXTURE_UNKNOWN_CASE_ID)
+      const latestReply = app.state.caseData.latest_reply
+      if (!latestReply) throw new Error('Synthetic unknown-reply fixture is missing its reply.')
+      app.state.reply = await app.fixtures.getReply(latestReply.reply_id)
+      app.state.replyId = app.state.reply.reply_id
+      app.state.screen = 'status'
+      break
+    }
     case 'resolve':
+      app.state.screen = 'resolve'
+      app.state.focusedAction = 0
+      app.state.acknowledgedUnknown = false
+      break
+    case 'resolve-unknown':
+      app.state.caseData = await app.fixtures.getCase(FIXTURE_UNKNOWN_CASE_ID)
       app.state.screen = 'resolve'
       app.state.focusedAction = 0
       app.state.acknowledgedUnknown = false

@@ -91,7 +91,8 @@ The images below are synthetic fixtures rendered by the Even Hub Simulator 0.9.5
 - AI suggestion and dictated owner draft: [draft.png](glasses-first-captures/draft.png), [owner-draft.png](glasses-first-captures/owner-draft.png)
 - Voice ready, simulated recording, and transcript: [voice-ready.png](glasses-first-captures/voice-ready.png), [voice-recording.png](glasses-first-captures/voice-recording.png), [transcript-preview.png](glasses-first-captures/transcript-preview.png)
 - Exact-text review and separate confirmation: [approval-review.png](glasses-first-captures/approval-review.png), [approval-confirm.png](glasses-first-captures/approval-confirm.png)
-- Reply status, resolution, and resolved state: [reply-status.png](glasses-first-captures/reply-status.png), [resolve.png](glasses-first-captures/resolve.png), [case-resolved.png](glasses-first-captures/case-resolved.png)
+- Daily schedule: [schedule.png](glasses-first-captures/schedule.png)
+- Reply status, unknown outcome, and resolution: [reply-status.png](glasses-first-captures/reply-status.png), [reply-unknown.png](glasses-first-captures/reply-unknown.png), [resolve.png](glasses-first-captures/resolve.png), [resolve-unknown-warning.png](glasses-first-captures/resolve-unknown-warning.png), [case-resolved.png](glasses-first-captures/case-resolved.png)
 
 ## Acceptance status and required hardware checks
 

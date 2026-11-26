@@ -15,7 +15,7 @@ import {
   paginateGlassesDisplayText,
   type GlassesState,
 } from '../src/glasses-ui.ts'
-import { DemoFixtures, FIXTURE_CASE_ID } from '../src/demo-fixtures.ts'
+import { DemoFixtures, FIXTURE_CASE_ID, FIXTURE_UNKNOWN_CASE_ID } from '../src/demo-fixtures.ts'
 import type { ReplyData } from '../src/types.ts'
 
 function makeState(overrides: Partial<GlassesState> = {}): GlassesState {
@@ -235,6 +235,25 @@ test('open fixture cases remain open until the synthetic resolver confirms them'
   assert.equal(result.status, 'resolved')
   const resolvedCase = await fixtures.getCase(FIXTURE_CASE_ID)
   assert.equal(buildGlassesPage(makeState({ screen: 'case', caseData: resolvedCase })).screen, 'case-resolved')
+})
+
+test('unknown reply status and resolution warning stay concise and actionable', async () => {
+  const fixtures = new DemoFixtures()
+  fixtures.startDemo()
+  const caseData = await fixtures.getCase(FIXTURE_UNKNOWN_CASE_ID)
+  assert.ok(caseData.latest_reply)
+  const reply = await fixtures.getReply(caseData.latest_reply.reply_id)
+  const status = buildGlassesPage(makeState({ screen: 'status', caseData, reply }))
+  const statusText = glassesPageText(status)
+  assert.match(statusText, /Status uncertain/)
+  assert.match(statusText, /Glance will not resend it automatically/)
+  assert.doesNotMatch(statusText, /Customer may have received it/)
+
+  const resolve = buildGlassesPage(makeState({ screen: 'resolve', caseData }))
+  const resolveText = glassesPageText(resolve)
+  assert.match(resolveText, /Customer may or may not have received it/)
+  assert.match(resolveText, /Menu: acknowledge/)
+  assert.match(JSON.stringify(resolve.menuObject), /Acknowledge uncertainty/)
 })
 
 test('case context pages render different bounded events and clamp missing or single-event pages', async () => {

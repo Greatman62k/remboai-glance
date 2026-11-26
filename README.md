@@ -47,7 +47,7 @@ evenhub-simulator http://127.0.0.1:5173 --automation-port 9898 --no-glow
 
 The simulator exposes a 576 × 288 G2 display. Its `/api/ping` endpoint only means the simulator process is ready; it does not mean the WebView, Even Hub bridge, startup page, or framebuffer is ready. Wait until the phone WebView reports `G2 connected · 576 × 288` or the glasses screenshot contains a rendered frame before capturing. This prevents a screenshot taken during startup from being mistaken for a blank app page.
 
-In a development build, render synthetic G2 states by adding `?g2-preview=` to the simulator URL: `inbox`, `schedule`, `case`, `case-older`, `draft`, `voice-ready`, `voice-recording`, `transcript-preview`, `approval-review`, `approval-confirm`, `reply-status`, `resolve`, or `case-resolved`. For example:
+In a development build, render synthetic G2 states by adding `?g2-preview=` to the simulator URL: `inbox`, `schedule`, `case`, `case-older`, `draft`, `voice-ready`, `voice-recording`, `transcript-preview`, `approval-review`, `approval-confirm`, `reply-status`, `reply-unknown`, `resolve`, `resolve-unknown`, or `case-resolved`. For example:
 
 ```sh
 evenhub-simulator 'http://127.0.0.1:5173/?g2-preview=voice-recording' --automation-port 9898 --no-glow

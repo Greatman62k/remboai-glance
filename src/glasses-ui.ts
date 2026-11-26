@@ -759,7 +759,7 @@ function replyPage(state: GlassesState): GlassesPage {
     submitted: `Submitted to ${channelLabel(item.channel)}\nDelivery not confirmed`,
     delivered: 'Delivery receipt confirmed',
     failed: 'Failed to send',
-    unknown: 'Status uncertain\nCustomer may have received it\nDo not retry',
+    unknown: 'Status uncertain',
     cancelled: 'Cancelled before dispatch\nNot sent',
   }
   const statusMark = reply.state === 'queued' ? G2_MARK.pending :
@@ -800,7 +800,7 @@ function resolvePage(state: GlassesState): GlassesPage {
   const header = `${warning ? `${G2_MARK.warning} ${warning} | ` : ''}Resolve ${name}?`
   if (needsAck) return pageWithZones('resolve', appHeader(state, 'Resolve case?', 'Reply outcome uncertain'),
     'Customer may or may not have received it.\nDo not retry the reply.',
-    `Case v${item.version}`, 'Use menu to acknowledge', {
+    `Case v${item.version}`, 'Menu: acknowledge', {
       emphasis: true,
       menu: [[G2_MENU.resolveAcknowledge, 'Acknowledge uncertainty'], [G2_MENU.resolveCancel, 'Cancel']],
       key: 'resolve-unknown-ack',
