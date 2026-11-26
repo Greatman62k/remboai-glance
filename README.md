@@ -17,6 +17,7 @@ Glance does not mirror a messaging app on smart glasses. It gives a busy owner a
 
 - [At a glance](#at-a-glance)
 - [Demo](#demo)
+- [Judge quickstart](#judge-quickstart-interactive-synthetic-demo)
 - [Built during the hackathon](#built-during-the-hackathon)
 - [The problem](#the-problem)
 - [Example](#example)
@@ -66,6 +67,23 @@ Glance does not mirror a messaging app on smart glasses. It gives a busy owner a
 The walkthrough follows one escalation from inbox to resolution: opening a case, reading its context, preparing a draft by voice, reviewing the exact text page by page, approving it, and checking the outcome.
 
 The demo runs in the Even Hub Simulator with synthetic records. It is not footage of physical glasses or of a live ASR transaction. To step through the same screens yourself, see [Synthetic screen previews](#synthetic-screen-previews).
+
+### Judge quickstart: interactive synthetic demo
+
+From the repository root, install the locked dependencies and start the local UI in fixture mode. The installed Vite version requires Node.js **20.19 or newer in the 20.x series, or 22.12 and newer**; the lockfile supplies Even Hub SDK 0.0.16 and Simulator 0.9.5.
+
+```bash
+npm ci
+VITE_GLANCE_DEMO_FIXTURES=true npm run dev -- --host 127.0.0.1
+```
+
+In a second terminal, launch the simulator:
+
+```bash
+npm exec -- evenhub-simulator -- 'http://127.0.0.1:5173' --automation-port 9898 --no-glow
+```
+
+In the companion WebView, choose **Open synthetic development demo**. Use a fresh local origin or browser profile without a saved Glance session so startup does not validate an earlier live session first. Then follow the G2 workflow from Inbox through case review, simulated voice, exact-text review, approval, outcome, and resolution. Cases, AI drafts, transcript, reply status, and resolution are fixture behavior—not live AI or ASR. The microphone stays off, and the demo flow does not call the backend or send a message. For a single screen at a time, use the [`g2-preview` routes](#synthetic-screen-previews).
 
 ## Built during the hackathon
 
@@ -140,6 +158,17 @@ flowchart TD
     V -->|Yes| W[Resolve the case with a reason]
     V -->|Unknown| X[Review warning and acknowledge uncertainty]
     X --> W
+
+    classDef external fill:#EAF1FF,stroke:#476AA8,color:#18263E,stroke-width:1px
+    classDef backend fill:#EEE9FA,stroke:#6B50A6,color:#29203F,stroke-width:1px
+    classDef owner fill:#FFF2D6,stroke:#B87912,color:#49330E,stroke-width:1px
+    classDef wearable fill:#E3F5F0,stroke:#267A69,color:#17372F,stroke-width:1px
+    classDef complete fill:#E8F5E9,stroke:#4F8A52,color:#1E3B22,stroke-width:1px
+    class A external
+    class B,C,D,K,O backend
+    class F,J,M,Q,R,T,V,X owner
+    class G,H,I,L,N,P wearable
+    class E,S,W complete
 ```
 
 ### What the owner can do
@@ -153,6 +182,8 @@ flowchart TD
 | **Schedule** | View the owner's salon-local daily schedule as a read-only supporting view |
 
 A generated draft is a suggestion and a transcript is input. Neither sends anything until the owner reviews and approves the final text.
+
+See [Glasses-first workflow details](docs/glasses-first-workflow.md) for the interaction model, recovery behavior, performance notes, and simulator capture references.
 
 ## Designed for the G2 display and controls
 
@@ -170,7 +201,7 @@ On the inbox root, double-click invokes Even Hub's system exit confirmation. The
 
 ### Exact-text approval
 
-Before approval, Glance divides the outgoing reply into ordered pages of up to three wrapped text lines. The owner advances through the pages in order, and only after the review sequence is complete does the final-confirmation action become available.
+Before approval, Glance divides the outgoing reply into ordered pages of up to five wrapped text lines. The owner advances through the pages in order, and only after the review sequence is complete does the final-confirmation action become available.
 
 Review progress resets if the text changes, the case version changes, the owner cancels, or the app resumes from a background interruption. If the G2 renderer may alter unsupported characters, Glance offers an explicit **Create ASCII copy** action. It creates a new version of the text, and the owner reviews it from the beginning before approving.
 
@@ -264,6 +295,17 @@ flowchart LR
     end
 
     WEB <-->|HTTPS API requests| API
+
+    classDef external fill:#EAF1FF,stroke:#476AA8,color:#18263E,stroke-width:1px
+    classDef backend fill:#EEE9FA,stroke:#6B50A6,color:#29203F,stroke-width:1px
+    classDef owner fill:#FFF2D6,stroke:#B87912,color:#49330E,stroke-width:1px
+    classDef wearable fill:#E3F5F0,stroke:#267A69,color:#17372F,stroke-width:1px
+    classDef complete fill:#E8F5E9,stroke:#4F8A52,color:#1E3B22,stroke-width:1px
+    class C,TG external
+    class CH,RB,API backend
+    class CASE owner
+    class G2,HUB,WEB wearable
+    class AUTO complete
 ```
 
 ### Main client responsibilities
@@ -398,6 +440,8 @@ npm ci
 
 ### Configure
 
+This step is optional for the judge quickstart above. The synthetic simulator demo needs no `.env.local` or backend; configure an API root only when developing against a separately running Glance backend.
+
 Copy the example environment file:
 
 ```bash
@@ -424,7 +468,7 @@ npm run build
 ### Open the simulator
 
 ```bash
-evenhub-simulator http://127.0.0.1:5173 --automation-port 9898 --no-glow
+npm exec -- evenhub-simulator -- 'http://127.0.0.1:5173' --automation-port 9898 --no-glow
 ```
 
 The simulator exposes a 576 × 288 display. Its `/api/ping` endpoint only indicates that the simulator process is ready. It does not prove that the WebView, Even Hub bridge, startup page, or framebuffer is ready. Wait for the app to report `G2 connected · 576 × 288`, or confirm that the glasses display contains a rendered frame, before capturing.
@@ -438,7 +482,7 @@ Development builds support `?g2-preview=` states for offline UI walkthroughs:
 For example:
 
 ```bash
-evenhub-simulator 'http://127.0.0.1:5173/?g2-preview=voice-recording' --automation-port 9898 --no-glow
+npm exec -- evenhub-simulator -- 'http://127.0.0.1:5173/?g2-preview=voice-recording' --automation-port 9898 --no-glow
 ```
 
 These routes use synthetic fixtures, skip saved-session loading and backend polling, and never start the microphone. Recording states are marked as simulation with the microphone off. They are for UI review only. They send no customer messages and say nothing about backend or provider behaviour.
@@ -447,16 +491,16 @@ These routes use synthetic fixtures, skip saved-session loading and backend poll
 
 The repository includes automated tests for the client workflow, SDK event handling, native page payloads, request behaviour, voice-intent separation, and bounded PCM capture. The simulator provides local visual and interaction checks. These checks do not replace physical-device and live-service acceptance.
 
-| Area | Current evidence / status |
-|---|---|
-| G2 screen layout | Native 576 × 288 layouts exercised in Even Hub Simulator 0.9.5 |
-| Client workflow | Automated tests and synthetic simulator walkthroughs |
-| Voice state machine | Owner-started capture path and injected PCM tests. Simulator audio itself is not treated as captured speech |
-| Physical G2 microphone and ASR | Not yet accepted on physical G2 with the live ASR provider |
-| Ring and temple controls | SDK event handling is implemented. Physical-device behaviour remains to be validated |
-| Locked-phone / background lifecycle | Resume and recovery logic is implemented. Complete phone-locked hardware acceptance remains outstanding |
-| Packaged WebView networking | Production HTTPS routing and packaged WebView CORS acceptance remain outstanding |
-| Live Telegram delivery | Channel-specific end-to-end acceptance is separate from simulator previews |
+| Area | Evidence available in this repository | Still needs separate acceptance |
+|---|---|---|
+| G2 screen layout | Native 576 × 288 synthetic captures from Even Hub Simulator 0.9.5 | Physical G2 display and layout behavior |
+| Client workflow and API client | Automated frontend tests and the synthetic fixture walkthrough | Live service behavior is not established by fixture mode or unit tests |
+| Backend integration | [The integration harness](tests/backend-integration.ts) passed locally on 2026-11-26 against isolated FastAPI and Caddy services; it is separate from `npm test` and uses synthetic records and provider stubs | Live external provider behavior is not covered by this harness |
+| Voice capture and transcription | Bounded PCM and injected audio-event tests; simulator previews keep the microphone off | Physical G2 microphone capture and live ASR provider behavior |
+| G2 and ring inputs | SDK event parsing and simulator interaction checks | Physical ring and temple input behavior |
+| Locked-phone lifecycle | Client recovery behavior and automated lifecycle tests | Official Beta Testing with the phone locked for the required interval |
+| Packaged networking | Configurable API base and authenticated client behavior | HTTPS and CORS acceptance from the packaged Even Hub WebView origin |
+| Telegram delivery | Reply-state handling and isolated/intercepted test paths | Live Telegram submission; provider acceptance must not be described as customer delivery |
 
 The local simulator environment can expose a zero-sample audio input, so automated voice-capture tests inject controlled PCM events. They do not establish that the physical G2 microphone captured speech. Android may suspend the WebView while it is backgrounded. Glance closes microphone capture on suspension and does not claim that recording continues or resumes automatically.
 

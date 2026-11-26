@@ -58,7 +58,7 @@ The native UI uses at most three text containers or two text containers plus one
 
 ## Exact-text approval
 
-The full outgoing message is split into ordered pages of at most three wrapped text lines so the exact text, page position, and review progress fit together on the 576 × 288 display. Each page displays its position and is marked reviewed only after the owner advances through it. A separate final-confirmation state appears only after every page has been traversed. The owner must then explicitly choose **Approve & queue**. Cancelling, changing the draft, editing the text, detecting a changed case, or returning from background resets review progress.
+The full outgoing message is split into ordered pages of at most five wrapped text lines so the exact text, page position, and review progress fit together on the 576 × 288 display. Each page displays its position and is marked reviewed only after the owner advances through it. A separate final-confirmation state appears only after every page has been traversed. The owner must then explicitly choose **Approve & queue**. Cancelling, changing the draft, editing the text, detecting a changed case, or returning from background resets review progress.
 
 The SDK's display font handling is not a guarantee that every Unicode character will render byte-for-byte. When a draft includes unsupported glyphs, G2 offers an explicit **Create ASCII copy** action. It saves a new owner draft through the existing manual-draft endpoint, converts known punctuation and diacritics, and shows unknown glyphs as `?`. This is a content change: the owner must inspect the new exact text on G2 and complete a fresh review before approval. The optional phone editor remains available, but is not required for this path.
 
